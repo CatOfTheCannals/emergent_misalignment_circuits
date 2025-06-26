@@ -40,28 +40,46 @@ def mean_error_node_attrib_score(
         A python ``float`` with the MENAS value.
     """
 
-    # Number of node types
-    n_features = len(graph.selected_features)
-    n_error = graph.cfg.n_layers * len(graph.input_tokens)
-    n_logits = len(graph.logit_tokens)
+    # ------------------------------------------------------------------
+    # 1) Derive *how many* nodes of each type we have so that we can
+    #    translate "feature / error / token / logit" into contiguous
+    #    index ranges inside the big adjacency matrix `A`.
+    # ------------------------------------------------------------------
+    n_features = len(graph.selected_features)                       # interpretable neurons
+    n_error = graph.cfg.n_layers * len(graph.input_tokens)          # 1 error per (layer, token)
+    n_logits = len(graph.logit_tokens)                              # how many logits we kept
 
     if n_logits == 0:
         raise ValueError("Graph does not contain logit nodes.")
 
-    # Build slices for the adjacency matrix
-    error_cols = slice(n_features, n_features + n_error)  # contiguous block
-    logit_rows_all = slice(-n_logits, None)  # last rows correspond to logits
+    # ------------------------------------------------------------------
+    # 2) Build *slice* objects that pick out exactly the block we care
+    #    about in `A`.
+    #       • `error_cols` — all error nodes as *columns* (sources)
+    #       • rows for logits will be computed below because they may be
+    #         a subset.
+    # ------------------------------------------------------------------
+    error_cols = slice(n_features, n_features + n_error)            # contiguous [features, errors)
+    # (logit_rows_all kept for clarity even though we don't end up using it)
+    _logit_rows_all = slice(-n_logits, None)
 
+    # ------------------------------------------------------------------
+    # 3) Figure out which **logit rows** we should include:
+    #       a) If the caller passed `logit_subset`, we map those vocab IDs
+    #          to their corresponding rows.
+    #       b) Otherwise we take *all* logits present in the graph.
+    # ------------------------------------------------------------------
     A = graph.adjacency_matrix  # Alias
 
-    # --- Select rows ----------------------------------------------------
     if logit_subset is not None:
-        # Ensure tensor on same device as A
+        # Convert the subset to a tensor that lives on the same device as `A`
         subset = torch.as_tensor(logit_subset, device=A.device)
         if subset.ndim == 0:
             subset = subset.unsqueeze(0)
 
-        # Map vocab ids → row indices inside the adjacency matrix
+        # `graph.logit_tokens` stores the vocab ID for each logit row.
+        # We build a boolean mask telling us which rows to keep, then
+        # convert it to row indices.
         vocab_tensor = graph.logit_tokens.to(A.device)
         row_mask = torch.isin(vocab_tensor, subset)
         if not torch.any(row_mask):
@@ -70,7 +88,13 @@ def mean_error_node_attrib_score(
     else:
         logit_rows = torch.arange(A.shape[0] - n_logits, A.shape[0], device=A.device)
 
-    # --- Compute numerator & denominator --------------------------------
+    # ------------------------------------------------------------------
+    # 4) Compute MENAS.
+    #    numerator  = total |attribution| flowing *from error nodes* into
+    #                 the selected logits.
+    #    denominator (only when `use_ratio=True`) = total |attribution|
+    #                 those logits receive from *any* source.
+    # ------------------------------------------------------------------
     submatrix = A.index_select(0, logit_rows)[:, error_cols]
     numer = submatrix.abs().sum()
 
