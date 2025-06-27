@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from circuit_tracer.graph import Graph
 
-from emergent_misalignment_circuits.metrics import mean_error_node_attrib_score
+from emergent_misalignment_circuits.metrics import error_node_attribution_score
 
 
 def _make_mock_graph():
@@ -50,7 +50,7 @@ def _make_mock_graph():
 
 def test_menas_mean():
     g = _make_mock_graph()
-    value = mean_error_node_attrib_score(g, use_ratio=False)
+    value = error_node_attribution_score(g, use_ratio=False)
 
     # Expected: total |error weights| = 1.0; num_selected_logits = 1
     assert abs(value - 1.0) < 1e-6
@@ -58,7 +58,7 @@ def test_menas_mean():
 
 def test_menas_ratio():
     g = _make_mock_graph()
-    value = mean_error_node_attrib_score(g, use_ratio=True)
+    value = error_node_attribution_score(g, use_ratio=True)
 
     # Numerator: 1.0 ; Denominator: |error| + |feature| = 1.0 + 0.4 = 1.4
     expected = 1.0 / 1.4
@@ -68,15 +68,15 @@ def test_menas_ratio():
 def test_menas_logit_subset():
     g = _make_mock_graph()
     # Subset containing existing token 42 should work and match full result
-    val_subset = mean_error_node_attrib_score(g, logit_subset=[42])
-    val_full = mean_error_node_attrib_score(g)
+    val_subset = error_node_attribution_score(g, logit_subset=[42])
+    val_full = error_node_attribution_score(g)
     assert abs(val_subset - val_full) < 1e-6
 
     # Subset with a missing token should raise
     import pytest
 
     with pytest.raises(ValueError):
-        mean_error_node_attrib_score(g, logit_subset=[999])
+        error_node_attribution_score(g, logit_subset=[999])
 
 
 def _make_complex_graph():
@@ -135,11 +135,11 @@ def test_menas_complex_mean_and_ratio():
     g = _make_complex_graph()
     # Raw mean (per-logit) expected: (0.5 + 0.5 + 0.6) / 3 = 0.533333...
     expected_mean = (0.5 + 0.5 + 0.6) / 3
-    assert abs(mean_error_node_attrib_score(g) - expected_mean) < 1e-6
+    assert abs(error_node_attribution_score(g) - expected_mean) < 1e-6
 
     # Because each logit row sums to 1.0, ratio equals the same number
     expected_ratio = expected_mean
-    assert abs(mean_error_node_attrib_score(g, use_ratio=True) - expected_ratio) < 1e-6
+    assert abs(error_node_attribution_score(g, use_ratio=True) - expected_ratio) < 1e-6
 
 
 def test_menas_complex_subset():
@@ -150,7 +150,7 @@ def test_menas_complex_subset():
     expected_mean = expected_numer / 2  # two logits
     expected_ratio = expected_numer / 2  # denominator 1.0 + 1.0 = 2.0
 
-    assert abs(mean_error_node_attrib_score(g, logit_subset=subset_tokens) - expected_mean) < 1e-6
+    assert abs(error_node_attribution_score(g, logit_subset=subset_tokens) - expected_mean) < 1e-6
     assert abs(
-        mean_error_node_attrib_score(g, logit_subset=subset_tokens, use_ratio=True) - expected_ratio
+        error_node_attribution_score(g, logit_subset=subset_tokens, use_ratio=True) - expected_ratio
     ) < 1e-6 

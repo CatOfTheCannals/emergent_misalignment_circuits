@@ -13,7 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from circuit_tracer.attribution import attribute
 from circuit_tracer.replacement_model import ReplacementModel
-from emergent_misalignment_circuits.metrics import mean_error_node_attrib_score
+from emergent_misalignment_circuits.metrics import error_node_attribution_score
 
 
 ###############################################################################
@@ -195,7 +195,7 @@ def run_eval(
                     max_n_logits=10,
                     offload="cpu",           # move model weights to CPU during back-prop
                 )
-                menas_val = mean_error_node_attrib_score(g, use_ratio=True)
+                score_val = error_node_attribution_score(g, use_ratio=True)
 
                 # Save completion
                 comp_path = completions_dir / f"{pid}_s{k}.txt"
@@ -217,7 +217,7 @@ def run_eval(
                     "prompt": prompt,
                     "completion_file": str(comp_path.relative_to(out_dir)),
                     "graph_file": str(graph_path.relative_to(out_dir)) if graph_path else None,
-                    "menas": menas_val,
+                    "error_node_attrib": score_val,
                 }
                 summary_f.write(json.dumps(row) + "\n")
                 summary_f.flush()
@@ -232,7 +232,7 @@ def run_eval(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate MENAS benchmark data for first_plot_questions."
+        description="Generate error-node attribution benchmark data for first_plot_questions."
     )
     parser.add_argument("yaml_file", type=Path, help="Path to first_plot_questions.yaml")
     parser.add_argument("base_model", type=str)
@@ -241,7 +241,7 @@ def main():
         "--out",
         type=Path,
         default=Path(
-            "emergent_misalignment_circuits/results/first_plot_questions_menas_analysis"
+            "emergent_misalignment_circuits/results/first_plot_questions_error_node_analysis"
         ),
     )
     parser.add_argument("--n", type=int, default=25)

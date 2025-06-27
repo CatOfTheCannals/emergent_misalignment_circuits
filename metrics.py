@@ -3,22 +3,39 @@ from typing import Optional, Sequence, Iterable
 
 from circuit_tracer.graph import Graph
 
+# -----------------------------------------------------------------------------
+# Public API (no acronyms, no misleading "mean" when ratio is returned)
+# -----------------------------------------------------------------------------
 __all__ = [
-    "mean_error_node_attrib_score",
-    "menas_for_graphs",
-]
+    "error_node_attribution_score",
+    "error_node_attribution_score_for_graphs",
+    # Back-compat exports -----------------------------------------------------
+    "mean_error_node_attrib_score",  # deprecated
+    "menas_for_graphs",               # deprecated
+]  # fmt: off
 
 
-def mean_error_node_attrib_score(
+# -----------------------------------------------------------------------------
+# Core metric
+# -----------------------------------------------------------------------------
+
+
+def error_node_attribution_score(
     graph: Graph,
     logit_subset: Optional[Sequence[int]] = None,
     *,
     use_ratio: bool = False,
 ) -> float:
-    """Compute the *Mean Error-Node Attribution Score* (MENAS).
+    """Compute the **Error-Node Attribution Score**.
 
-    MENAS measures how much of the attribution mass flowing into the selected
-    logit nodes originates from *error* nodes.
+    The score measures how much of the attribution mass flowing into the
+    selected logit nodes originates from *error* nodes. Two reduction modes are
+    supported via *use_ratio*:
+
+    • ``use_ratio=False`` (default)  →  *mean* absolute error attribution per
+       selected logit.
+    • ``use_ratio=True``            →  *fraction* of the total attribution that
+       comes from error nodes.
 
     Nodes are ordered in the adjacency matrix as
     ``[features, errors, tokens, logits]`` (see :class:`circuit_tracer.graph.Graph`).
@@ -26,24 +43,26 @@ def mean_error_node_attrib_score(
     ``A[target, source]`` is the scalar influence of *source* on *target*.
 
     Args:
-        graph: A fully-dense attribution :class:`~circuit_tracer.graph.Graph`.
-        logit_subset: Optional list / tensor with vocabulary IDs specifying
-            which rows (logits) to include in the computation. If *None*, all
-            logits present in the graph are used.
-        use_ratio: If *True* return the **fraction** of total attribution mass
-            to the selected logits that comes from error nodes
-            (``Σ|A[logit, error]| / Σ|A[logit, *]|``). If *False*, return the
-            **mean absolute attribution mass per selected logit** that comes
-            from error nodes (``Σ|A[logit, error]| / n_selected_logits``).
+        graph: An attribution :class:`~circuit_tracer.graph.Graph` with a dense
+            adjacency matrix.
+        logit_subset: Optional 1-D sequence or tensor containing vocabulary IDs
+            of logits to include. When *None*, all logits present in the graph
+            are used.
+        use_ratio: If *True* return the **fraction** of attribution to the
+            chosen logits that comes from error nodes
+            (``Σ|A[logit, error]| / Σ|A[logit, *]|``). If *False* return the
+            **mean absolute attribution mass per selected logit** originating
+            from error nodes
+            (``Σ|A[logit, error]| / n_selected_logits``).
 
     Returns:
-        A python ``float`` with the MENAS value.
+        The requested score as a python ``float``.
     """
 
     # ------------------------------------------------------------------
-    # 1) Derive *how many* nodes of each type we have so that we can
-    #    translate "feature / error / token / logit" into contiguous
-    #    index ranges inside the big adjacency matrix `A`.
+    # 1) Derive *how many* nodes of each type we have so that we can translate
+    #    "feature / error / token / logit" into contiguous index ranges inside
+    #    the big adjacency matrix `A`.
     # ------------------------------------------------------------------
     n_features = len(graph.selected_features)                       # interpretable neurons
     n_error = graph.cfg.n_layers * len(graph.input_tokens)          # 1 error per (layer, token)
@@ -89,7 +108,7 @@ def mean_error_node_attrib_score(
         logit_rows = torch.arange(A.shape[0] - n_logits, A.shape[0], device=A.device)
 
     # ------------------------------------------------------------------
-    # 4) Compute MENAS.
+    # 4) Compute the score.
     #    numerator  = total |attribution| flowing *from error nodes* into
     #                 the selected logits.
     #    denominator (only when `use_ratio=True`) = total |attribution|
@@ -106,16 +125,31 @@ def mean_error_node_attrib_score(
     return (numer / logit_rows.numel()).item()
 
 
-def menas_for_graphs(
+# -----------------------------------------------------------------------------
+# Convenience helper across many graphs
+# -----------------------------------------------------------------------------
+
+
+def error_node_attribution_score_for_graphs(
     graphs: Iterable[Graph],
     logit_subset: Optional[Sequence[int]] = None,
     *,
     use_ratio: bool = False,
 ) -> float:
-    """Convenience helper – compute the average MENAS over many graphs."""
+    """Compute the *average* error-node attribution score over many graphs."""
 
     values = [
-        mean_error_node_attrib_score(g, logit_subset=logit_subset, use_ratio=use_ratio)
+        error_node_attribution_score(g, logit_subset=logit_subset, use_ratio=use_ratio)
         for g in graphs
     ]
-    return float(torch.tensor(values).mean()) 
+    return float(torch.tensor(values).mean())
+
+
+# -----------------------------------------------------------------------------
+# Backward-compatibility aliases (deprecate in the future)
+# -----------------------------------------------------------------------------
+
+
+# pylint: disable=invalid-name
+mean_error_node_attrib_score = error_node_attribution_score
+menas_for_graphs = error_node_attribution_score_for_graphs 

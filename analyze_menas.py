@@ -6,11 +6,11 @@ from typing import Dict, List, Tuple
 import torch
 
 from circuit_tracer.graph import Graph
-from emergent_misalignment_circuits.metrics import mean_error_node_attrib_score
+from emergent_misalignment_circuits.metrics import error_node_attribution_score
 
 
 ResultRow = Tuple[str, float, float, float, float]
-# directory_slug, base_menas, em_menas, delta, pct_change
+# directory_slug, base_score, em_score, delta, pct_change
 
 
 def scan_graph_pairs(root: Path) -> List[Tuple[str, Path, Path]]:
@@ -27,19 +27,19 @@ def scan_graph_pairs(root: Path) -> List[Tuple[str, Path, Path]]:
     return pairs
 
 
-def calc_menas(path: Path, *, use_ratio: bool) -> float:
+def calc_score(path: Path, *, use_ratio: bool) -> float:
     g = Graph.from_pt(str(path))
-    return mean_error_node_attrib_score(g, use_ratio=use_ratio)
+    return error_node_attribution_score(g, use_ratio=use_ratio)
 
 
 def analyze(root: Path, *, use_ratio: bool = True) -> List[ResultRow]:
     rows: List[ResultRow] = []
     for slug, base_path, em_path in scan_graph_pairs(root):
-        base_menas = calc_menas(base_path, use_ratio=use_ratio)
-        em_menas = calc_menas(em_path, use_ratio=use_ratio)
-        delta = em_menas - base_menas
-        pct_change = (delta / abs(base_menas)) * 100 if base_menas != 0 else float("nan")
-        rows.append((slug, base_menas, em_menas, delta, pct_change))
+        base_score = calc_score(base_path, use_ratio=use_ratio)
+        em_score = calc_score(em_path, use_ratio=use_ratio)
+        delta = em_score - base_score
+        pct_change = (delta / abs(base_score)) * 100 if base_score != 0 else float("nan")
+        rows.append((slug, base_score, em_score, delta, pct_change))
     return rows
 
 
@@ -48,7 +48,7 @@ def print_report(rows: List[ResultRow], *, output_json: Path = None):
         print("No graph pairs found.")
         return
 
-    header = f"{'Action':25s} {'MENAS_base':>10s} {'MENAS_em':>10s} {'Δ (em-base)':>12s} {'%Δ':>8s}"
+    header = f"{'Action':25s} {'ErrNode_base':>10s} {'ErrNode_em':>10s} {'Δ (em-base)':>12s} {'%Δ':>8s}"
     print(header)
     print("-" * len(header))
     for slug, base, em, delta, pct in rows:
@@ -64,8 +64,8 @@ def print_report(rows: List[ResultRow], *, output_json: Path = None):
         data = [
             {
                 "action": slug,
-                "menas_base": base,
-                "menas_em": em,
+                "score_base": base,
+                "score_em": em,
                 "delta": delta,
                 "pct_change": pct,
             }
@@ -76,7 +76,7 @@ def print_report(rows: List[ResultRow], *, output_json: Path = None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compute and compare MENAS for base vs. EM graphs.")
+    parser = argparse.ArgumentParser(description="Compute and compare error-node attribution scores for base vs. EM graphs.")
     parser.add_argument(
         "root",
         type=Path,
