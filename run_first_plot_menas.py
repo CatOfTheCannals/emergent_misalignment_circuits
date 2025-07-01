@@ -4,17 +4,30 @@ import os
 import random
 import re
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 import torch
 import yaml
+from dotenv import load_dotenv
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import gc
 
 from circuit_tracer.attribution import attribute
 from circuit_tracer.replacement_model import ReplacementModel
+from circuit_tracer.transcoder import load_transcoder_set
 from emergent_misalignment_circuits.metrics import error_node_attribution_score
 
+# Optional PEFT (LoRA/adapters) support ---------------------------------------------------
+try:
+    from peft import PeftModel  # type: ignore
+
+    _PEFT_AVAILABLE = True
+except ImportError:  # pragma: no cover – peft is optional
+    _PEFT_AVAILABLE = False
+
+# Load environment variables from .env file
+load_dotenv()
 
 ###############################################################################
 # Helpers
@@ -61,14 +74,56 @@ def parse_questions(yaml_path: Path) -> Dict[str, str]:
     return questions
 
 
-def build_generation_model(name_or_path: str, device: str):
-    """Return tokenizer and HF causal model for sampling completions."""
-    tok = AutoTokenizer.from_pretrained(name_or_path)
-    model = (
-        AutoModelForCausalLM.from_pretrained(name_or_path, torch_dtype=torch.float16)
-        .to(device)
-        .eval()
-    )
+def _load_hf_model_with_optional_adapter(
+    model_or_adapter_path: str,
+    base_model_path: str,
+    device_map: str | Dict[str, int] = "auto",
+):
+    """Return an *eager* `AutoModelForCausalLM`.
+
+    The function first tries to interpret *model_or_adapter_path* as a full HF
+    model.  If that fails (e.g. because it's actually a PEFT adapter folder),
+    we fall back to loading *base_model_path* and merging the adapter weights
+    via `peft.PeftModel.merge_and_unload()`.
+    """
+    dtype = torch.float16
+    try:
+        # Happy path: it's already a merged or standalone model.
+        return AutoModelForCausalLM.from_pretrained(
+            model_or_adapter_path,
+            torch_dtype=dtype,
+            device_map=device_map,
+        )
+    except (OSError, ValueError):
+        # Likely not a full HF model -> treat as adapter.
+        if not _PEFT_AVAILABLE:
+            raise RuntimeError(
+                "The provided path appears to be a PEFT adapter, but the"
+                " 'peft' package is not installed.  Install with"
+                " `pip install peft` or provide a merged model instead."
+            )
+        # Load base model **on CPU** to avoid double GPU allocation during merge
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_path,
+            torch_dtype=dtype,
+            device_map={"": "cpu"},  # keep weights on CPU initially
+            low_cpu_mem_usage=True,
+        )
+        # Merge adapter weights into the base model (returns a normal HF model)
+        base_model = PeftModel.from_pretrained(base_model, model_or_adapter_path).merge_and_unload()
+        return base_model
+
+
+def build_generation_model_or_adapter(
+    model_or_adapter_path: str,
+    base_model_path: str,
+    device: str,
+) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
+    """Return a tokenizer + model pair, supporting either merged or adapter paths."""
+    tok = AutoTokenizer.from_pretrained(base_model_path)
+    model = _load_hf_model_with_optional_adapter(
+        model_or_adapter_path, base_model_path, device_map="auto"
+    ).to(device).eval()
     return tok, model
 
 
@@ -83,13 +138,13 @@ def build_base_replacement(model_name: str, device_str: str):
     )
 
 
-def build_merged_replacement(local_model_path: str, device_str: str):
-    """Load local merged HF model and attach same 'llama' transcoders."""
-    from circuit_tracer.transcoder import load_transcoder_set
+def build_merged_replacement(local_model_path: str, base_model_path: str, device_str: str):
+    """Load **either** a merged model *or* a PEFT adapter and attach 'llama' transcoders."""
 
     device_obj = torch.device(device_str)
-    merged_hf_model = AutoModelForCausalLM.from_pretrained(
-        local_model_path, torch_dtype=torch.float16, device_map="auto"
+
+    merged_hf_model = _load_hf_model_with_optional_adapter(
+        local_model_path, base_model_path, device_map="auto"
     )
 
     transcoders, fin_hook, fout_hook, scan = load_transcoder_set(
@@ -97,7 +152,7 @@ def build_merged_replacement(local_model_path: str, device_str: str):
     )
 
     return ReplacementModel.from_pretrained_and_transcoders(
-        model_name="meta-llama/Llama-3.2-1B",  # base config
+        model_name=base_model_path,  # Ensure cache reuse
         transcoders=transcoders,
         feature_input_hook=fin_hook,
         feature_output_hook=fout_hook,
@@ -264,7 +319,9 @@ def main():
 
     # ---------- BASE MODEL --------------------------------------------------
     if args.run in ("base", "both"):
-        tok_b, gen_b = build_generation_model(args.base_model, args.device)
+        tok_b, gen_b = build_generation_model_or_adapter(
+            args.base_model, args.base_model, args.device
+        )
         rep_b = build_base_replacement(args.base_model, args.device)
         run_eval(
             tok_b,
@@ -276,14 +333,21 @@ def main():
             save_graphs=False,
         )
 
-        # Free GPU memory before possibly running the merged model
-        del tok_b, gen_b, rep_b
+        # move cached transcoders off GPU
+        rep_b.transcoders.to("cpu")
+
+        del rep_b, tok_b, gen_b
+        gc.collect()
         torch.cuda.empty_cache()
 
     # ---------- MERGED MODEL ------------------------------------------------
     if args.run in ("merged", "both"):
-        tok_m, gen_m = build_generation_model(args.merged_model, args.device)
-        rep_m = build_merged_replacement(args.merged_model, args.device)
+        tok_m, gen_m = build_generation_model_or_adapter(
+            args.merged_model, args.base_model, args.device
+        )
+        rep_m = build_merged_replacement(
+            args.merged_model, args.base_model, args.device
+        )
         run_eval(
             tok_m,
             gen_m,
