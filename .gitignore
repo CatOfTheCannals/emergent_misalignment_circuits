@@ -1,5 +1,6 @@
 .venv
 .vscode
 hf_token.txt
+.env
 __pycache__
 results/
