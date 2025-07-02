@@ -3,6 +3,8 @@ from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from dotenv import load_dotenv
+import os
 
 try:
     from peft import PeftModel  # type: ignore
@@ -11,6 +13,10 @@ except ImportError as e:  # pragma: no cover
         "The 'peft' package is required for adapter merging. Install with:\n"
         "    pip install peft\n"
     ) from e
+
+load_dotenv()
+if os.getenv("HF_TOKEN") and not os.getenv("HUGGINGFACE_HUB_TOKEN"):
+    os.environ["HUGGINGFACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
 
 
 def merge_adapter_into_base(
