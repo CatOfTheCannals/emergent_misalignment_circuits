@@ -29,11 +29,35 @@ import json
 import os
 from pathlib import Path
 from typing import List, Dict
+import logging
+import sys
 
 from dotenv import load_dotenv  # type: ignore
 from openai import OpenAI  # type: ignore
 
 from emergent_misalignment_circuits.pivotal_tokens import io
+
+# ---------------------------------------------------------------------------
+# Standard libs
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timezone
+import logging
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+
+log = logging.getLogger(__name__)
+logging.getLogger().setLevel(logging.DEBUG)  # ensure root level
+log.debug("Logging configured – starting generate_prompts")
 
 # ---------------------------------------------------------------------------
 # OpenAI helper
@@ -158,12 +182,16 @@ def main() -> None:
         f"{h['prompt']} ⇒ {h['verdict']} ({h['summary']})" for h in history_entries
     )
 
+    log.debug("History context provided to generator:\n%s", formatted_history)
+
     user_msg = USER_TEMPLATE.format(n=len(history_entries), history=formatted_history)
 
     messages = [
         {"role": "system", "content": SYSTEM_MESSAGE},
         {"role": "user", "content": user_msg},
     ]
+
+    log.debug("Chat messages payload: %s", messages)
 
     # ------------------------------------------------------------------
     # Call model
@@ -176,7 +204,12 @@ def main() -> None:
         max_tokens=512,
     )
 
+    if not response.choices:
+        raise RuntimeError("OpenAI completion returned no choices – cannot generate prompt.")
+
     assistant_content = response.choices[0].message.content.strip()
+
+    log.debug("Assistant raw response:\n%s", assistant_content)
 
     # Try to parse as JSON
     try:
@@ -204,6 +237,7 @@ def main() -> None:
         json.dump(payload, f, indent=2)
 
     rel = out_path.relative_to(io.output_root())
+    log.info("Generated prompt saved to %s", rel)
     print(f"\n✓ Generated prompt saved to {rel}")
 
 
