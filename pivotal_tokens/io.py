@@ -26,21 +26,77 @@ name or local path) with characters unsafe for filenames replaced.
 
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Final
+from typing import Final, Optional
+import os
 import re
 
 # ---------------------------------------------------------------------------
-# Directory roots
+# Flexible output root under `results/pivotal_tokens/`
 # ---------------------------------------------------------------------------
 
-BASE_DIR: Final[Path] = Path(__file__).resolve().parent
-PROMPTS_DIR: Final[Path] = BASE_DIR / "prompts"
-RUNS_DIR: Final[Path] = BASE_DIR / "runs"
+# Environment variable that overrides where run-time artefacts go.
+_OUTPUT_ENV: Final[str] = "EMC_RESULTS_DIR"
 
-# Create top-level folders at import time so that later path helpers can assume
-# they exist.
-for _d in (PROMPTS_DIR, RUNS_DIR):
-    _d.mkdir(parents=True, exist_ok=True)
+# Internal mutable state so `set_output_root()` can change paths at runtime.
+_output_root: Optional[Path] = None
+
+
+def _determine_output_root() -> Path:
+    """Return the current output root directory (without the `pivotal_tokens/` suffix)."""
+    if _output_root is not None:
+        return _output_root
+
+    # 1) Environment variable takes precedence
+    env_val = os.getenv(_OUTPUT_ENV)
+    if env_val:
+        return Path(env_val).expanduser().resolve()
+
+    # 2) Default: <repo-root>/results
+    repo_root = Path(__file__).resolve().parents[1]
+    return repo_root / "results"
+
+
+def set_output_root(path: os.PathLike | str) -> None:
+    """Dynamically change where all run-time files are written.
+
+    Call early in your script (before writing anything) to redirect outputs,
+    e.g. `io.set_output_root('/scratch/$USER/emc/')`.
+    """
+    global _output_root, PROMPTS_DIR, RUNS_DIR
+
+    _output_root = Path(path).expanduser().resolve()
+    # Recompute the concrete folders and ensure they exist.
+    _refresh_static_dirs()
+
+
+def output_root() -> Path:
+    """Public accessor for the *current* output root."""
+    return _determine_output_root()
+
+# ---------------------------------------------------------------------------
+# Static folders beneath the output root
+# ---------------------------------------------------------------------------
+
+# These variables are (re)computed by `_refresh_static_dirs()` so they always
+# reflect the latest `output_root()` value.
+PROMPTS_DIR: Path  # populated below
+RUNS_DIR: Path     # populated below
+
+
+def _refresh_static_dirs() -> None:
+    """(Re)compute PROMPTS_DIR & RUNS_DIR and make sure they exist."""
+    global PROMPTS_DIR, RUNS_DIR
+
+    base: Path = output_root() / "pivotal_tokens"
+    PROMPTS_DIR = base / "prompts"
+    RUNS_DIR = base / "runs"
+
+    for _d in (PROMPTS_DIR, RUNS_DIR):
+        _d.mkdir(parents=True, exist_ok=True)
+
+
+# Called once at import so the directories exist with default rules.
+_refresh_static_dirs()
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -116,4 +172,6 @@ __all__ = [
     "verdicts_dir",
     "verdict_path",
     "model_dir_name",
+    "output_root",
+    "set_output_root",
 ] 

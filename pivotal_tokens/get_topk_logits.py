@@ -125,6 +125,12 @@ def main():
         default="raw",
         help="Input format for the prompt: 'raw' feeds the text directly, 'chat' wraps it as a single-turn chat with role=user (default: raw)",
     )
+    parser.add_argument(
+        "--results-dir",
+        type=str,
+        default=None,
+        help="Root directory where all artefacts are written (default: <repo>/results). Overrides EMC_RESULTS_DIR env var.",
+    )
     args = parser.parse_args()
 
     dtype_map = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
@@ -150,6 +156,13 @@ def main():
     model_identifier: str = args.model_name or args.model
 
     model_dir_name = io.model_dir_name(model_identifier)
+
+    # ------------------------------------------------------------------
+    # Configure output location *before* any path helpers are invoked.
+    # ------------------------------------------------------------------
+
+    if args.results_dir:
+        io.set_output_root(args.results_dir)
 
     for entry in tqdm(prompts_data):
         prompt_text = entry["prompt"] if isinstance(entry, dict) else entry
@@ -189,9 +202,10 @@ def main():
         with out_path.open("w") as f:
             json.dump(payload, f, indent=2)
 
+    # Relative path printout for user convenience
+    rel_runs = io.output_root() / "pivotal_tokens" / "runs" / io.model_dir_name(model_identifier) / "logits"
     print(
-        f"\n✓ Logits written to runs/{io.model_dir_name(model_identifier)}/logits/ for "
-        f"{len(prompts_data)} prompts using format '{args.format}'."
+        f"\n✓ Logits written to {rel_runs} for {len(prompts_data)} prompts using format '{args.format}'."
     )
 
 
