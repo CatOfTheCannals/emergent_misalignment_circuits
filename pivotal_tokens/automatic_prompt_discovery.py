@@ -45,10 +45,10 @@ def _extract_logits_with_preloaded(
     model,
     tokenizer,
     top_k: int,
+    prompt_type: str = "raw_completion",
 ) -> Path:
     """Compute & persist top-k logits reusing a pre-loaded model."""
 
-    import torch  # local import to keep type checkers happy
 
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
@@ -60,8 +60,9 @@ def _extract_logits_with_preloaded(
     payload = {
         "prompt_id": prompt_id,
         "prompt_text": prompt,
+        "prompt_type": prompt_type,
         "tested_model": model_id,
-        "format": "raw",
+        "format": prompt_type,
         "top_k": top,
     }
 
@@ -89,6 +90,7 @@ def main() -> None:
     p.add_argument("--judge", default="gpt-3.5-turbo")
     p.add_argument("--top-k", type=int, default=10)
     p.add_argument("--iterations", type=int, default=1, help="Number of prompts to explore (default 1)")
+    p.add_argument("--prompt-type", default="raw_completion", choices=["raw_completion", "chat_user_assistant", "chain_of_thought"], help="Type of prompt to generate (default: raw_completion)")
     p.add_argument("--results-dir")
     args = p.parse_args()
 
@@ -130,7 +132,7 @@ def main() -> None:
         log.info("\n=== Iteration %d / %d ===", i, args.iterations)
 
         # 1. Generate prompt
-        prompt_info = generate_prompt(args.generator)
+        prompt_info = generate_prompt(args.generator, prompt_type=args.prompt_type)
 
         # 2. Logits extraction
         baseline_logits = _extract_logits_with_preloaded(
@@ -140,6 +142,7 @@ def main() -> None:
             baseline_model,
             baseline_tokenizer,
             args.top_k,
+            prompt_info["prompt_type"],
         )
 
         tested_logits = _extract_logits_with_preloaded(
@@ -149,6 +152,7 @@ def main() -> None:
             tested_model,
             tested_tokenizer,
             args.top_k,
+            prompt_info["prompt_type"],
         )
 
         # 3. Verdict
