@@ -69,11 +69,13 @@ def main() -> None:
     )
 
     # 3. Verdict
+    client = None if args.judge.lower() == "human" else evaluate_logits._make_openai_client()
+
     evaluate_logits._evaluate_from_paths(
         baseline_logits,
         tested_logits,
         args.judge,
-        evaluate_logits._make_openai_client(),
+        client,
         k=args.top_k,
     )
 
