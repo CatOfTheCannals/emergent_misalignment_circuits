@@ -3,12 +3,12 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import List, Union, Dict, Tuple
+from typing import List, Union, Dict, Tuple, Optional
 
-import torch
-from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel
-from dotenv import load_dotenv
+import torch  # type: ignore
+from tqdm import tqdm  # type: ignore
+from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel  # type: ignore
+from dotenv import load_dotenv  # type: ignore
 
 # Local helpers that define filesystem conventions
 from emergent_misalignment_circuits.pivotal_tokens import io
@@ -88,12 +88,81 @@ def extract_top_k_for_models(
 
 
 # ---------------------------------------------------------------------------
+# High-level convenience (single model) – to be reused by the pipeline
+# ---------------------------------------------------------------------------
+
+
+def extract_top_k_single_model(
+    prompt: str,
+    prompt_id: str,
+    model_id: str,
+    k: int = 10,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[str] = None,
+    format_variant: str = "raw",
+) -> Path:
+    """Compute **and persist** top-*k* logits for *model_id*.
+
+    A thin wrapper around :func:`extract_top_k_for_models` that operates on a
+    single model.  Returns the path of the JSON that was written so other
+    modules (e.g. the pipeline) can chain further processing.
+    """
+
+    # Select device / dtype defaults
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if dtype is None:
+        dtype = torch.float16 if device == "cuda" else torch.float32
+
+    # Load resources ---------------------------------------------------
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = load_model(model_id, dtype=dtype, device=device)
+
+    # Delegate heavy lifting ------------------------------------------
+
+    extract_top_k_for_models(
+        prompt,
+        prompt_id,
+        [(model_id, model)],
+        tokenizer,
+        k,
+        format_variant=format_variant,
+    )
+
+    # -----------------------------------------------------------------
+    # Logging summary for humans
+    # -----------------------------------------------------------------
+
+    out_path = io.logits_path(prompt_id, model_id)
+    with out_path.open() as f:
+        data = json.load(f)
+    tokens = [t["token"] for t in data.get("top_k", [])]
+
+    import logging
+
+    log = logging.getLogger(__name__)
+    log.info("Top-%d tokens for model %s: %s", k, model_id, tokens)
+    log.info("Top-k logits saved to %s", out_path.relative_to(io.output_root()))
+
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # CLI entrypoint
 # ---------------------------------------------------------------------------
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare top-k next-token logits between two models.")
+    """CLI wrapper – parses arguments then delegates to *internal* helpers.
+
+    Keeping this wrapper minimal ensures the core logic is reusable from
+    other modules (e.g. the pipeline) without importing `__main__` side
+    effects or relying on duplicated code paths.
+    """
+
+    parser = argparse.ArgumentParser(description="Extract and store top-k next-token logits.")
     parser.add_argument("model", help="HF hub name or local path of the model whose logits we want")
     parser.add_argument(
         "--model-name",
@@ -138,75 +207,36 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Load tokenizer from the *base* model for consistency.
-    print("Loading tokenizer…")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-
-    print(f"Loading model '{args.model}' on {device}…")
-    model = load_model(args.model, dtype=dtype, device=device)
-
-    # Read prompts
-    prompts_path = Path(args.prompts)
-    with prompts_path.open() as f:
-        prompts_data = json.load(f)
-    print(f"Loaded {len(prompts_data)} prompts from {prompts_path}.")
-
-    print(f"\nExtracting top {args.top_k} logits for each prompt…")
-
-    model_identifier: str = args.model_name or args.model
-
-    model_dir_name = io.model_dir_name(model_identifier)
-
     # ------------------------------------------------------------------
-    # Configure output location *before* any path helpers are invoked.
+    # Parse & delegate
     # ------------------------------------------------------------------
 
     if args.results_dir:
         io.set_output_root(args.results_dir)
 
+    # Read prompts file ------------------------------------------------
+    prompts_path = Path(args.prompts)
+    with prompts_path.open() as f:
+        prompts_data = json.load(f)
+
+    print(f"Loaded {len(prompts_data)} prompts – extracting top-{args.top_k} logits…")
+
     for entry in tqdm(prompts_data):
-        prompt_text = entry["prompt"] if isinstance(entry, dict) else entry
+        text = entry["prompt"] if isinstance(entry, dict) else entry
+        prompt_id = entry.get("name") if isinstance(entry, dict) else None
+        prompt_id = prompt_id or io.new_prompt_id()
 
-        name_field = entry.get("name") if isinstance(entry, dict) else None
-        prompt_id: str = name_field if name_field else io.new_prompt_id()
+        extract_top_k_single_model(
+            text,
+            prompt_id,
+            args.model_name or args.model,
+            k=args.top_k,
+            dtype=dtype,
+            device=device,
+            format_variant=args.format,
+        )
 
-        # Render prompt according to requested format
-        if args.format == "chat":
-            conversation = [{"role": "user", "content": prompt_text}]
-            prompt_rendered = tokenizer.apply_chat_template(
-                conversation,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-        else:
-            prompt_rendered = prompt_text
-
-        # Compute logits and persist
-        inputs = tokenizer(prompt_rendered, return_tensors="pt").to(device)
-
-        with torch.no_grad():
-            logits_tensor = model(**inputs).logits[0, -1, :]
-
-        top_k = top_k_from_logits(logits_tensor, tokenizer, args.top_k)
-
-        out_path = io.logits_path(prompt_id, model_identifier)
-        payload = {
-            "prompt_id": prompt_id,
-            "prompt_text": prompt_text,
-            "tested_model": model_identifier,
-            "format": args.format,
-            "top_k": top_k,
-        }
-
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w") as f:
-            json.dump(payload, f, indent=2)
-
-    # Relative path printout for user convenience
-    rel_runs = io.output_root() / "pivotal_tokens" / "runs" / io.model_dir_name(model_identifier) / "logits"
-    print(
-        f"\n✓ Logits written to {rel_runs} for {len(prompts_data)} prompts using format '{args.format}'."
-    )
+    print("✓ Done.")
 
 
 # Allow import as module without side-effects

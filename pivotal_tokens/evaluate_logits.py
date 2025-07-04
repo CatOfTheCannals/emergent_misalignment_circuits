@@ -18,6 +18,8 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, List, Optional
+# Logging helper first so root handlers are consistent
+from emergent_misalignment_circuits.pivotal_tokens.logging_utils import configure_logging
 import logging
 import sys
 
@@ -27,18 +29,12 @@ from openai import OpenAI  # type: ignore
 from emergent_misalignment_circuits.pivotal_tokens import io
 
 # ---------------------------------------------------------------------------
-# Logging setup (DEBUG by default)
+# Logging setup
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    stream=sys.stdout,
-    force=True,
-)
+configure_logging()
 
 log = logging.getLogger(__name__)
-logging.getLogger().setLevel(logging.DEBUG)
 log.debug("Logging configured – starting evaluate_logits")
 
 # ---------------------------------------------------------------------------
@@ -187,6 +183,7 @@ def _evaluate_from_paths(baseline_path: Path, test_path: Path, judge_model: str,
 
     rel = v_path.relative_to(io.output_root())
     log.info("Verdict written to %s (abs: %s)", rel, v_path)
+    log.info("Verdict for %s: %s – %s", prompt_id, verdict_obj.get("verdict"), verdict_obj.get("summary"))
     print(f"✓ Verdict written: {rel}")
 
 

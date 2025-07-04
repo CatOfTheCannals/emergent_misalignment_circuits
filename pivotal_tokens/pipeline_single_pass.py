@@ -28,57 +28,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM  # type: ignore
 from emergent_misalignment_circuits.pivotal_tokens import io, get_topk_logits, evaluate_logits
 from emergent_misalignment_circuits.pivotal_tokens.generate_prompts import generate_prompt
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+# Shared logging setup across the toolkit
+from emergent_misalignment_circuits.pivotal_tokens.logging_utils import configure_logging
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    stream=sys.stdout,
-    force=True,
-)
+configure_logging()
 log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Logits extraction helper
-# ---------------------------------------------------------------------------
-
-def _load_model(model_id: str, dtype: torch.dtype, device: str):
-    return AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        device_map={"": device},
-        low_cpu_mem_usage=True,
-    ).eval()
-
-
-def extract_logits(prompt: str, prompt_id: str, model_id: str, top_k: int = 10) -> Path:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if device == "cuda" else torch.float32
-
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = _load_model(model_id, dtype, device)
-
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    with torch.no_grad():
-        logits = model(**inputs).logits[0, -1, :]
-
-    top = get_topk_logits.top_k_from_logits(logits, tokenizer, top_k)
-    out_path = io.logits_path(prompt_id, model_id)
-    payload = {
-        "prompt_id": prompt_id,
-        "prompt_text": prompt,
-        "tested_model": model_id,
-        "format": "raw",
-        "top_k": top,
-    }
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w") as f:
-        json.dump(payload, f, indent=2)
-
-    log.info("Top-k logits saved to %s", out_path.relative_to(io.output_root()))
-    return out_path
 
 # ---------------------------------------------------------------------------
 # Main orchestrator
@@ -101,8 +55,18 @@ def main() -> None:
     prompt_info = generate_prompt(args.generator)
 
     # 2. Logits baseline & tested
-    baseline_logits = extract_logits(prompt_info["prompt"], prompt_info["prompt_id"], args.baseline_model, args.top_k)
-    tested_logits = extract_logits(prompt_info["prompt"], prompt_info["prompt_id"], args.tested_model, args.top_k)
+    baseline_logits = get_topk_logits.extract_top_k_single_model(
+        prompt_info["prompt"],
+        prompt_info["prompt_id"],
+        args.baseline_model,
+        k=args.top_k,
+    )
+    tested_logits = get_topk_logits.extract_top_k_single_model(
+        prompt_info["prompt"],
+        prompt_info["prompt_id"],
+        args.tested_model,
+        k=args.top_k,
+    )
 
     # 3. Verdict
     evaluate_logits._evaluate_from_paths(

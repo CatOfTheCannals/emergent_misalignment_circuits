@@ -29,34 +29,22 @@ import json
 import os
 from pathlib import Path
 from typing import List, Dict, Optional, Any
-import logging
 import sys
 
 from dotenv import load_dotenv  # type: ignore
 from openai import OpenAI  # type: ignore
 
 from emergent_misalignment_circuits.pivotal_tokens import io
-
-# ---------------------------------------------------------------------------
-# Standard libs
-# ---------------------------------------------------------------------------
-
-from datetime import datetime, timezone
-import logging
+from emergent_misalignment_circuits.pivotal_tokens.logging_utils import configure_logging
 
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    stream=sys.stdout,
-    force=True,
-)
+configure_logging()
+import logging  # after configure_logging so root handlers exist
 
 log = logging.getLogger(__name__)
-logging.getLogger().setLevel(logging.DEBUG)  # ensure root level
 log.debug("Logging configured – starting generate_prompts")
 
 # ---------------------------------------------------------------------------
@@ -204,7 +192,8 @@ def generate_prompt(
 
     # Helpful progress log so caller can observe growth over time
     log.info("History size fed to generator: %d", len(history_entries))
-    log.debug("History context provided to generator:\n%s", formatted_history)
+    if formatted_history:
+        log.info("History context:\n%s", formatted_history)
 
     user_msg = USER_TEMPLATE.format(n=len(history_entries), history=formatted_history)
 
@@ -229,14 +218,32 @@ def generate_prompt(
     assistant_content = response.choices[0].message.content.strip()
     log.debug("Assistant raw response:\n%s", assistant_content)
 
+    # ------------------------------------------------------------------
+    # Helper: clean fenced code blocks and leading "json" tag
+    # ------------------------------------------------------------------
+
+    def _strip_fences(text: str) -> str:
+        if text.startswith("```"):
+            lines = [l for l in text.splitlines() if not l.startswith("```")]
+            return "\n".join(lines).strip()
+        return text
+
+    cleaned = _strip_fences(assistant_content)
+    if cleaned.lower().startswith("json"):
+        cleaned = cleaned[4:].lstrip()  # drop leading 'json' and whitespace
+
     # Parse --------------------------------------------------------------
 
+    prompt_text: str
+    name_field: str
+
     try:
-        generated = json.loads(assistant_content)
-        prompt_text: str = generated["prompt"]
-        name_field: str = generated.get("name") or io.new_prompt_id()
+        generated = json.loads(cleaned)
+        prompt_text = generated["prompt"]
+        name_field = generated.get("name") or io.new_prompt_id()
     except Exception:
-        prompt_text = assistant_content.strip().strip("`")
+        # Fallback: treat entire cleaned content as prompt text
+        prompt_text = cleaned
         name_field = io.new_prompt_id()
 
     prompt_id: str = io.new_prompt_id()
@@ -255,6 +262,7 @@ def generate_prompt(
         json.dump(payload, f, indent=2)
 
     log.info("Generated prompt saved to %s", out_path.relative_to(io.output_root()))
+    log.info("Generated prompt (%s): %s", prompt_id, prompt_text)
 
     return {"prompt_id": prompt_id, "name": name_field, "prompt": prompt_text, "path": out_path}
 
