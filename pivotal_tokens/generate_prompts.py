@@ -28,7 +28,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional, Any
 import logging
 import sys
 
@@ -156,6 +156,110 @@ USER_TEMPLATE = (
 
 
 # ---------------------------------------------------------------------------
+# Public helper
+# ---------------------------------------------------------------------------
+
+
+def generate_prompt(
+    model: str = "gpt-3.5-turbo",
+    *,
+    history: int = 20,
+    results_dir: Optional[str] = None,
+    client: Optional[OpenAI] = None,
+) -> Dict[str, Any]:
+    """Generate one pivotal-token prompt and persist it.
+
+    Parameters
+    ----------
+    model:
+        Chat completion model name.
+    history:
+        How many recent verdicts to include for context.
+    results_dir:
+        If provided, overrides the default output root.
+    client:
+        Pre-configured OpenAI client (mainly for tests).  A new one is
+        created with `_make_openai_client()` if ``None``.
+
+    Returns
+    -------
+    Dict with keys ``prompt_id``, ``name``, ``prompt`` and ``path`` (absolute ``Path``).
+    """
+
+    if results_dir:
+        io.set_output_root(results_dir)
+
+    if client is None:
+        client = _make_openai_client()
+
+    # type sanity for linters
+    assert client is not None
+
+    # Recent history -----------------------------------------------------
+
+    history_entries = _collect_verdict_summaries(limit=history)
+    formatted_history = "\n".join(
+        f"{h['prompt']} ⇒ {h['verdict']} ({h['summary']})" for h in history_entries
+    )
+
+    # Helpful progress log so caller can observe growth over time
+    log.info("History size fed to generator: %d", len(history_entries))
+    log.debug("History context provided to generator:\n%s", formatted_history)
+
+    user_msg = USER_TEMPLATE.format(n=len(history_entries), history=formatted_history)
+
+    messages = [
+        {"role": "system", "content": SYSTEM_MESSAGE},
+        {"role": "user", "content": user_msg},
+    ]
+    log.debug("Chat messages payload: %s", messages)
+
+    # Call model ---------------------------------------------------------
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.9,
+        max_tokens=512,
+    )
+
+    if not response.choices:
+        raise RuntimeError("OpenAI completion returned no choices – cannot generate prompt.")
+
+    assistant_content = response.choices[0].message.content.strip()
+    log.debug("Assistant raw response:\n%s", assistant_content)
+
+    # Parse --------------------------------------------------------------
+
+    try:
+        generated = json.loads(assistant_content)
+        prompt_text: str = generated["prompt"]
+        name_field: str = generated.get("name") or io.new_prompt_id()
+    except Exception:
+        prompt_text = assistant_content.strip().strip("`")
+        name_field = io.new_prompt_id()
+
+    prompt_id: str = io.new_prompt_id()
+    out_path = io.prompt_path(prompt_id, model)
+
+    payload = {
+        "prompt_id": prompt_id,
+        "name": name_field,
+        "prompt": prompt_text,
+        "generator_model": model,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w") as f:
+        json.dump(payload, f, indent=2)
+
+    log.info("Generated prompt saved to %s", out_path.relative_to(io.output_root()))
+
+    return {"prompt_id": prompt_id, "name": name_field, "prompt": prompt_text, "path": out_path}
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -168,76 +272,13 @@ def main() -> None:
                         help="Override the default output root (same semantics as other scripts).")
     args = parser.parse_args()
 
-    if args.results_dir:
-        io.set_output_root(args.results_dir)
-
-    client = _make_openai_client()
-
-    # ------------------------------------------------------------------
-    # Prepare chat messages
-    # ------------------------------------------------------------------
-
-    history_entries = _collect_verdict_summaries(limit=args.history)
-    formatted_history = "\n".join(
-        f"{h['prompt']} ⇒ {h['verdict']} ({h['summary']})" for h in history_entries
-    )
-
-    log.debug("History context provided to generator:\n%s", formatted_history)
-
-    user_msg = USER_TEMPLATE.format(n=len(history_entries), history=formatted_history)
-
-    messages = [
-        {"role": "system", "content": SYSTEM_MESSAGE},
-        {"role": "user", "content": user_msg},
-    ]
-
-    log.debug("Chat messages payload: %s", messages)
-
-    # ------------------------------------------------------------------
-    # Call model
-    # ------------------------------------------------------------------
-
-    response = client.chat.completions.create(
+    info = generate_prompt(
         model=args.model,
-        messages=messages,
-        temperature=0.9,
-        max_tokens=512,
+        history=args.history,
+        results_dir=args.results_dir,
     )
 
-    if not response.choices:
-        raise RuntimeError("OpenAI completion returned no choices – cannot generate prompt.")
-
-    assistant_content = response.choices[0].message.content.strip()
-
-    log.debug("Assistant raw response:\n%s", assistant_content)
-
-    # Try to parse as JSON
-    try:
-        generated = json.loads(assistant_content)
-        prompt_text: str = generated["prompt"]
-        name_field: str = generated.get("name") or io.new_prompt_id()
-    except Exception:
-        # Fall back to raw string if model misbehaves
-        prompt_text = assistant_content.strip().strip("`")
-        name_field = io.new_prompt_id()
-
-    prompt_id: str = io.new_prompt_id()
-
-    out_path = io.prompt_path(prompt_id, args.model)
-    payload = {
-        "prompt_id": prompt_id,
-        "name": name_field,
-        "prompt": prompt_text,
-        "generator_model": args.model,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w") as f:
-        json.dump(payload, f, indent=2)
-
-    rel = out_path.relative_to(io.output_root())
-    log.info("Generated prompt saved to %s", rel)
+    rel = info["path"].relative_to(io.output_root())
     print(f"\n✓ Generated prompt saved to {rel}")
 
 
