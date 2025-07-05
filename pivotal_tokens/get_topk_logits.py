@@ -37,6 +37,145 @@ def top_k_from_logits(logits: torch.Tensor, tokenizer, k: int) -> List[Dict[str,
 
 
 # ---------------------------------------------------------------------------
+# Server mode functionality
+# ---------------------------------------------------------------------------
+
+
+class LogitServer:
+    """Server that loads models once and allows interactive prompt querying."""
+    
+    def __init__(self, models: List[str], k: int = 10, dtype: torch.dtype = torch.float16, device: str = "cpu"):
+        """Initialize server with models.
+        
+        Parameters
+        ----------
+        models : List[str]
+            List of model identifiers (HF hub names or local paths)
+        k : int
+            Number of top logits to return
+        dtype : torch.dtype
+            Data type for model weights
+        device : str
+            Device to load models on
+        """
+        self.k = k
+        self.device = device
+        self.dtype = dtype
+        
+        print(f"Loading {len(models)} models...")
+        
+        # Load tokenizer from first model (assumes compatible)
+        self.tokenizer = AutoTokenizer.from_pretrained(models[0])
+        
+        # Load all models
+        self.models = []
+        for model_id in models:
+            print(f"Loading {model_id}...")
+            model = load_model(model_id, dtype=dtype, device=device)
+            self.models.append((model_id, model))
+        
+        print("✓ All models loaded successfully!")
+    
+    def query_prompt(self, prompt: str, format_variant: str = "raw") -> Dict[str, List[Dict[str, float]]]:
+        """Query a prompt and return top-k logits for all models.
+        
+        Parameters
+        ----------
+        prompt : str
+            The prompt text to query
+        format_variant : str
+            Format variant ("raw" or "chat")
+            
+        Returns
+        -------
+        Dict[str, List[Dict[str, float]]]
+            Dictionary mapping model names to their top-k logits
+        """
+        # Format prompt if needed
+        if format_variant == "chat":
+            prompt = f"user: {prompt}\nassistant:"
+        
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        
+        results = {}
+        
+        with torch.no_grad():
+            for model_name, model in self.models:
+                logits = model(**inputs).logits[0, -1, :]
+                top_k = top_k_from_logits(logits, self.tokenizer, self.k)
+                results[model_name] = top_k
+        
+        return results
+    
+    def print_results(self, prompt: str, results: Dict[str, List[Dict[str, float]]]):
+        """Pretty print the results."""
+        print(f"\n=== Top-{self.k} logits for prompt: ===")
+        print(f'"{prompt}"')
+        print()
+        
+        for model_name, top_k in results.items():
+            print(f"Model: {model_name}")
+            for i, item in enumerate(top_k, 1):
+                token = str(item["token"]).replace("\n", "\\n")
+                logit = item["logit"]
+                print(f"  {i:2d}. '{token}' ({logit:.3f})")
+            print()
+    
+    def interactive_mode(self):
+        """Start interactive mode for continuous prompt querying."""
+        print("\n=== Logit Server Interactive Mode ===")
+        print("Enter prompts to get top-k logits for all models.")
+        print("Type 'quit' or 'exit' to stop.")
+        print("Type 'help' for format options.")
+        print("-" * 50)
+        
+        while True:
+            try:
+                prompt = input("\nEnter prompt: ").strip()
+                
+                if prompt.lower() in ['quit', 'exit', 'q']:
+                    print("Goodbye!")
+                    break
+                
+                if prompt.lower() == 'help':
+                    print("\nFormat options:")
+                    print("  raw:  Use prompt as-is")
+                    print("  chat: Wrap as 'user: <prompt>\\nassistant:'")
+                    print("  Example: 'raw: Hello world' or 'chat: What is 2+2?'")
+                    continue
+                
+                if not prompt:
+                    continue
+                
+                # Check for format prefix
+                format_variant = "raw"
+                if prompt.startswith("raw:"):
+                    prompt = prompt[4:].strip()
+                elif prompt.startswith("chat:"):
+                    prompt = prompt[5:].strip()
+                    format_variant = "chat"
+                
+                if not prompt:
+                    continue
+                
+                # Query models
+                results = self.query_prompt(prompt, format_variant)
+                self.print_results(prompt, results)
+                
+            except KeyboardInterrupt:
+                print("\nGoodbye!")
+                break
+            except Exception as e:
+                print(f"Error: {e}")
+
+
+def run_server_mode(models: List[str], k: int = 10, dtype: torch.dtype = torch.float16, device: str = "cpu"):
+    """Run the server in interactive mode."""
+    server = LogitServer(models, k, dtype, device)
+    server.interactive_mode()
+
+
+# ---------------------------------------------------------------------------
 # Core helpers
 # ---------------------------------------------------------------------------
 
@@ -163,7 +302,7 @@ def main():
     """
 
     parser = argparse.ArgumentParser(description="Extract and store top-k next-token logits.")
-    parser.add_argument("model", help="HF hub name or local path of the model whose logits we want")
+    parser.add_argument("model", nargs="?", help="HF hub name or local path of the model whose logits we want")
     parser.add_argument(
         "--model-name",
         type=str,
@@ -200,6 +339,21 @@ def main():
         default=None,
         help="Root directory where all artefacts are written (default: <repo>/results). Overrides EMC_RESULTS_DIR env var.",
     )
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="Run in server mode - load models once and allow interactive prompt querying",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        help="List of models to use in server mode (required when --server is used)",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        help="Single prompt to query (for non-server mode with single prompt)",
+    )
     args = parser.parse_args()
 
     dtype_map = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
@@ -208,8 +362,36 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ------------------------------------------------------------------
-    # Parse & delegate
+    # Server mode
     # ------------------------------------------------------------------
+    if args.server:
+        if not args.models:
+            parser.error("--server requires --models to specify which models to load")
+        if args.results_dir:
+            io.set_output_root(args.results_dir)
+        run_server_mode(args.models, args.top_k, dtype, device)
+        return
+
+    # ------------------------------------------------------------------
+    # Single prompt mode
+    # ------------------------------------------------------------------
+    if args.prompt:
+        if not args.model:
+            parser.error("--prompt requires a model to be specified")
+        if args.results_dir:
+            io.set_output_root(args.results_dir)
+        
+        # Create a simple server for single prompt
+        server = LogitServer([args.model], args.top_k, dtype, device)
+        results = server.query_prompt(args.prompt, args.format)
+        server.print_results(args.prompt, results)
+        return
+
+    # ------------------------------------------------------------------
+    # Original batch mode (requires model argument)
+    # ------------------------------------------------------------------
+    if not args.model:
+        parser.error("model argument is required for batch mode")
 
     if args.results_dir:
         io.set_output_root(args.results_dir)
