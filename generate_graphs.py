@@ -6,6 +6,22 @@ from typing import Dict, List, Optional, Union
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
+from dotenv import load_dotenv
+
+# Load environment variables and set up HF authentication
+load_dotenv()
+if "HF_TOKEN" in os.environ:
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+    try:
+        from huggingface_hub import login
+        login(token=os.environ["HF_TOKEN"])
+        print("HuggingFace authentication successful")
+    except ImportError:
+        print("Warning: huggingface_hub not available for login")
+    except Exception as e:
+        print(f"Warning: HuggingFace authentication failed: {e}")
+else:
+    print("Warning: HF_TOKEN not found in environment")
 
 from circuit_tracer.attribution import attribute
 from circuit_tracer.replacement_model import ReplacementModel

@@ -9,12 +9,14 @@ handling memory constraints and unbalanced datasets.
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 import torch
 import numpy as np
 from collections import defaultdict
 import pickle
+from dotenv import load_dotenv
 
 import sys
 sys.path.append('/workspace/circuit-tracer')
@@ -26,6 +28,23 @@ from circuit_tracer.attribution import attribute
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# Set up HuggingFace authentication
+if "HF_TOKEN" in os.environ:
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+    try:
+        from huggingface_hub import login
+        login(token=os.environ["HF_TOKEN"])
+        logger.info("HuggingFace authentication successful")
+    except ImportError:
+        logger.warning("huggingface_hub not available for login")
+    except Exception as e:
+        logger.warning(f"HuggingFace authentication failed: {e}")
+else:
+    logger.warning("HF_TOKEN not found in environment - you may encounter authentication issues")
 
 
 def load_json_file(file_path: Path) -> Dict:
@@ -91,9 +110,87 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
     return labeled_data
 
 
+def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path) -> Optional[Path]:
+    """Find existing graph file for a given stable_id and model."""
+    model_safe_name = model_name.replace('/', '_').replace(' ', '_')
+    prompt_dir = graphs_dir / model_safe_name / stable_id
+    
+    # Check for different graph file types
+    possible_files = [
+        "base_graph.pt",
+        "merged_graph.pt", 
+        "graph.pt"
+    ]
+    
+    for filename in possible_files:
+        graph_path = prompt_dir / filename
+        if graph_path.exists():
+            logger.info(f"Found existing graph: {graph_path}")
+            return graph_path
+    
+    return None
+
+
+def generate_graph_with_model(
+    stable_id: str,
+    model_display_name: str,
+    prompt_text: str,
+    graphs_dir: Path,
+    replacement_model
+) -> Optional[Path]:
+    """Generate graph using pre-built replacement model."""
+    model_safe_name = model_display_name.replace('/', '_').replace(' ', '_')
+    prompt_dir = graphs_dir / model_safe_name / stable_id
+    
+    # Determine graph filename
+    graph_filename = "merged_graph.pt"  # Assume adapted model for now
+    expected_graph_path = prompt_dir / graph_filename
+    
+    try:
+        # Create output directory
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate graph using the pre-built model
+        logger.info(f"Generating attribution graph for prompt: {stable_id}")
+        
+        graph = attribute(
+            prompt=prompt_text,
+            model=replacement_model,
+            max_n_logits=10,
+            desired_logit_prob=0.95,
+            batch_size=128,  # Smaller batch for adapted models
+            max_feature_nodes=512,  # Very few features for convergence
+            offload='disk',  # More aggressive offloading
+            verbose=True,
+        )
+        
+        # Save graph
+        graph.to_pt(expected_graph_path)
+        logger.info(f"Saved graph to: {expected_graph_path}")
+        
+        # Clear graph from memory
+        del graph
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        return expected_graph_path
+        
+    except Exception as e:
+        logger.error(f"Failed to generate graph for {stable_id}: {e}")
+        
+        # If debug mode, re-raise to stop execution  
+        if hasattr(generate_graph_with_model, '_debug_convergence'):
+            logger.error("DEBUG MODE: Re-raising exception to stop after first failure")
+            raise
+        
+        return None
+
+
 def find_or_generate_graph(
     stable_id: str, 
     model_name: str, 
+    model_display_name: str,
     prompt_text: str,
     graphs_dir: Path,
     base_model_path: str = "meta-llama/Llama-3.2-1B-Instruct",
@@ -102,21 +199,21 @@ def find_or_generate_graph(
 ) -> Optional[Path]:
     """Find existing graph or generate it if it doesn't exist."""
     
-    # Check if graph already exists in the expected location
-    # Structure: graphs_dir/{model_name}/{stable_id}/base_graph.pt or merged_graph.pt
-    model_safe_name = model_name.replace('/', '_').replace(' ', '_')
+    # Check if graph already exists
+    existing_graph = find_matching_graph(stable_id, model_display_name, graphs_dir)
+    if existing_graph:
+        return existing_graph
+    
+    # Determine graph structure based on model type
+    model_safe_name = model_display_name.replace('/', '_').replace(' ', '_')
     prompt_dir = graphs_dir / model_safe_name / stable_id
     
     is_base_model = model_name == base_model_path or "meta-llama" in model_name
     graph_filename = "base_graph.pt" if is_base_model else "merged_graph.pt"
     expected_graph_path = prompt_dir / graph_filename
     
-    if expected_graph_path.exists():
-        logger.info(f"Found existing graph: {expected_graph_path}")
-        return expected_graph_path
-    
     # Graph doesn't exist, need to generate it
-    logger.info(f"Graph not found for {stable_id} with {model_name}, generating...")
+    logger.info(f"Graph not found for {stable_id} with {model_display_name}, generating...")
     
     try:
         # Create output directory
@@ -128,25 +225,54 @@ def find_or_generate_graph(
             replacement_model = build_base_replacement_model(base_model_path, device)
         else:
             if not adapted_model_path:
-                # Try to infer adapted model path from model_name
-                adapted_model_path = model_name
+                raise ValueError(f"adapted_model_path must be provided for adapted model: {model_display_name}")
             logger.info(f"Building adapted model: {adapted_model_path}")
             replacement_model = build_replacement_model(
-                model_name, adapted_model_path, base_model_path, device
+                model_display_name, adapted_model_path, base_model_path, device
             )
         
-        # Generate graph
+        # Generate graph with memory-efficient settings
         logger.info(f"Generating attribution graph for prompt: {stable_id}")
-        graph = attribute(
-            prompt=prompt_text,
-            model=replacement_model,
-            max_n_logits=10,
-            desired_logit_prob=0.95,
-            batch_size=256,
-            max_feature_nodes=8192,
-            offload='cpu',
-            verbose=True,
-        )
+        
+        # Use memory-efficient settings for adapted models
+        is_adapted = not (model_name == base_model_path or "meta-llama" in model_name)
+        if is_adapted:
+            batch_size = 128  # Smaller batch size to reduce memory usage
+            max_feature_nodes = 8192  # Keep full feature nodes for analysis quality
+            offload = 'disk'  # More aggressive offloading
+        else:
+            batch_size = 256
+            max_feature_nodes = 8192
+            offload = 'cpu'
+        
+        # Try attribution with increased tolerance for adapted models
+        try:
+            graph = attribute(
+                prompt=prompt_text,
+                model=replacement_model,
+                max_n_logits=10,
+                desired_logit_prob=0.95,
+                batch_size=batch_size,
+                max_feature_nodes=max_feature_nodes,
+                offload=offload,
+                verbose=True,
+            )
+        except RuntimeError as e:
+            if "Failed to converge" in str(e) and is_adapted:
+                logger.warning(f"Convergence failed for adapted model, trying with fewer features...")
+                # Try with fewer features for numerical stability
+                graph = attribute(
+                    prompt=prompt_text,
+                    model=replacement_model,
+                    max_n_logits=10,
+                    desired_logit_prob=0.95,
+                    batch_size=batch_size,
+                    max_feature_nodes=max_feature_nodes // 2,  # Half the features
+                    offload=offload,
+                    verbose=True,
+                )
+            else:
+                raise
         
         # Save graph
         graph.to_pt(expected_graph_path)
@@ -154,7 +280,9 @@ def find_or_generate_graph(
         
         # Clean up model from memory
         del replacement_model
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
         
         return expected_graph_path
         
@@ -207,16 +335,83 @@ def compute_feature_statistics(graph: Graph, evil_logit_indices: List[int], safe
     return stats
 
 
+def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: List[str]) -> Tuple[List[int], List[int]]:
+    """Match labeled tokens to graph logit indices more accurately."""
+    # Get the actual logit tokens from the graph
+    logit_tokens = graph.logit_tokens
+    
+    # Convert to strings for comparison
+    if hasattr(logit_tokens, 'tolist'):
+        logit_token_strings = [str(token) for token in logit_tokens.tolist()]
+    else:
+        logit_token_strings = [str(token) for token in logit_tokens]
+    
+    evil_logit_indices = []
+    safe_logit_indices = []
+    
+    # Find exact matches first
+    for i, logit_token in enumerate(logit_token_strings):
+        # Clean up token representation for comparison
+        clean_token = logit_token.strip().replace("'", "").replace('"', '')
+        
+        if clean_token in evil_tokens:
+            evil_logit_indices.append(i)
+        elif clean_token in safe_tokens:
+            safe_logit_indices.append(i)
+    
+    # If no exact matches, try substring matching
+    if not evil_logit_indices and not safe_logit_indices:
+        for i, logit_token in enumerate(logit_token_strings):
+            clean_token = logit_token.strip().replace("'", "").replace('"', '')
+            
+            # Check if any evil token is a substring of this logit token
+            for evil_token in evil_tokens:
+                if evil_token.lower() in clean_token.lower() or clean_token.lower() in evil_token.lower():
+                    if i not in evil_logit_indices:
+                        evil_logit_indices.append(i)
+                    break
+            
+            # Check if any safe token is a substring of this logit token
+            for safe_token in safe_tokens:
+                if safe_token.lower() in clean_token.lower() or clean_token.lower() in safe_token.lower():
+                    if i not in safe_logit_indices:
+                        safe_logit_indices.append(i)
+                    break
+    
+    logger.debug(f"Matched {len(evil_logit_indices)} evil tokens and {len(safe_logit_indices)} safe tokens")
+    
+    return evil_logit_indices, safe_logit_indices
+
+
 def analyze_single_model(
     model_name: str,
+    model_display_name: str,
     labeled_data: Dict[str, Dict],
     graphs_dir: Path,
     output_dir: Path,
-    top_k_features: int = 50
+    top_k_features: int = 50,
+    base_model_path: str = "meta-llama/Llama-3.2-1B-Instruct",
+    adapted_model_path: str = None,
+    generate_missing_graphs: bool = False
 ) -> Dict:
     """Analyze a single model and save results to avoid memory buildup."""
     
-    logger.info(f"Analyzing model: {model_name}")
+    logger.info(f"Analyzing model: {model_display_name}")
+    
+    # Build replacement model once for all prompts if we need to generate graphs
+    replacement_model = None
+    if generate_missing_graphs:
+        is_base_model = model_name == base_model_path or "meta-llama" in model_name
+        if is_base_model:
+            logger.info(f"Building base model: {base_model_path}")
+            replacement_model = build_base_replacement_model(base_model_path, "cuda")
+        else:
+            if not adapted_model_path:
+                raise ValueError(f"adapted_model_path must be provided for adapted model: {model_display_name}")
+            logger.info(f"Building adapted model: {adapted_model_path}")
+            replacement_model = build_replacement_model(
+                model_display_name, adapted_model_path, base_model_path, "cuda"
+            )
     
     # Accumulate statistics across all prompts
     accumulated_stats = defaultdict(list)
@@ -226,40 +421,33 @@ def analyze_single_model(
     
     for stable_id, token_data in labeled_data.items():
         # Find corresponding graph
-        graph_path = find_matching_graph(stable_id, model_name, graphs_dir)
+        graph_path = find_matching_graph(stable_id, model_display_name, graphs_dir)
         
         if not graph_path:
-            logger.warning(f"No graph found for {stable_id} with model {model_name}")
-            continue
+            if generate_missing_graphs:
+                # Check if this is an adapted model and we should skip generation
+                is_base_model = model_name == base_model_path or "meta-llama" in model_name
+                if not is_base_model and hasattr(analyze_single_model, '_skip_adapted_generation'):
+                    logger.warning(f"Skipping graph generation for adapted model {model_display_name} due to memory constraints")
+                else:
+                    logger.info(f"Generating missing graph for {stable_id} with model {model_display_name}")
+                    graph_path = generate_graph_with_model(
+                        stable_id, model_display_name, token_data['prompt_text'],
+                        graphs_dir, replacement_model
+                    )
+            
+            if not graph_path:
+                logger.warning(f"No graph found for {stable_id} with model {model_display_name}")
+                continue
         
         try:
             # Load graph
             graph = Graph.from_pt(str(graph_path))
             
-            # Find logit indices for evil and safe tokens
-            logit_tokens = graph.logit_tokens.tolist()
-            evil_logit_indices = []
-            safe_logit_indices = []
-            
-            # This is simplified - you may need tokenizer to map properly
-            # For now, assume we can match by top probability indices
-            logit_probs = graph.logit_probabilities.tolist()
-            sorted_indices = np.argsort(logit_probs)[::-1]
-            
-            # Take top logits as candidates and compare with our labeled tokens
-            # This is a simplified approach - you may want to refine token matching
-            n_candidates = min(20, len(sorted_indices))
-            candidate_indices = sorted_indices[:n_candidates]
-            
-            # For now, assume evil tokens are in the top few and safe tokens follow
-            n_evil = len(token_data['evil_tokens'])
-            n_safe = len(token_data['safe_tokens'])
-            
-            if n_evil > 0:
-                evil_logit_indices = candidate_indices[:min(n_evil, len(candidate_indices))]
-            if n_safe > 0:
-                remaining_candidates = candidate_indices[len(evil_logit_indices):]
-                safe_logit_indices = remaining_candidates[:min(n_safe, len(remaining_candidates))]
+            # Match labeled tokens to graph logit indices
+            evil_logit_indices, safe_logit_indices = match_tokens_to_logits(
+                graph, token_data['evil_tokens'], token_data['safe_tokens']
+            )
             
             # Compute statistics for this prompt
             stats = compute_feature_statistics(graph, evil_logit_indices, safe_logit_indices)
@@ -280,7 +468,9 @@ def analyze_single_model(
             
             # Clear graph from memory
             del graph
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
             
             logger.info(f"Processed {processed_count}/{len(labeled_data)}: {stable_id}")
             
@@ -315,7 +505,7 @@ def analyze_single_model(
         top_indices = torch.argsort(aggregated_stats['abs_mean_diff_mean'], descending=True)[:top_k_features]
         
         # Load a sample graph to get feature info
-        sample_graph_path = find_matching_graph(list(labeled_data.keys())[0], model_name, graphs_dir)
+        sample_graph_path = find_matching_graph(list(labeled_data.keys())[0], model_display_name, graphs_dir)
         if sample_graph_path:
             sample_graph = Graph.from_pt(str(sample_graph_path))
             
@@ -338,9 +528,10 @@ def analyze_single_model(
             del sample_graph
     
     # Save results
-    model_safe_name = model_name.replace('/', '_').replace(' ', '_')
+    model_safe_name = model_display_name.replace('/', '_').replace(' ', '_')
     results = {
         'model_name': model_name,
+        'model_display_name': model_display_name,
         'processed_prompts': processed_count,
         'prompt_summary': prompt_results,
         'top_features': top_features,
@@ -365,6 +556,14 @@ def analyze_single_model(
     
     logger.info(f"Saved results to {results_file}")
     
+    # Clean up replacement model from memory
+    if replacement_model is not None:
+        del replacement_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        logger.info("Cleaned up replacement model from memory")
+    
     return results
 
 
@@ -388,8 +587,8 @@ def compare_models(base_results: Dict, adapted_results: Dict, output_dir: Path):
         
         # Compare top features between models
         comparison = {
-            'base_model': base_results['model_name'],
-            'adapted_model': adapted_results['model_name'],
+            'base_model': base_results['model_display_name'],
+            'adapted_model': adapted_results['model_display_name'],
             'base_top_features': list(base_results.get('top_features', {}).keys())[:10],
             'adapted_top_features': list(adapted_results.get('top_features', {}).keys())[:10],
             'feature_overlap': [],
@@ -433,13 +632,27 @@ def main():
     parser.add_argument("--base-model", type=str, 
                        default="meta-llama/Llama-3.2-1B-Instruct",
                        help="Base model name")
-    parser.add_argument("--adapted-model", type=str,
-                       default="emergent_misalignment_circuits_results_bad_med_layer4_r1_merged_model",
-                       help="Adapted model name")
+    parser.add_argument("--adapted-model-path", type=str,
+                       help="Path to adapted model (required for adapted model analysis)")
+    parser.add_argument("--adapted-model-name", type=str,
+                       default="adapted_model",
+                       help="Display name for adapted model")
     parser.add_argument("--top-k", type=int, default=50,
                        help="Number of top features to analyze")
+    parser.add_argument("--generate-missing-graphs", action="store_true",
+                       help="Generate graphs if they don't exist")
+    parser.add_argument("--skip-adapted-generation", action="store_true",
+                       help="Skip graph generation for adapted models to save memory")
+    parser.add_argument("--adapted-only", action="store_true",
+                       help="Only analyze adapted model (skip base model to save memory)")
+    parser.add_argument("--base-only", action="store_true",
+                       help="Only analyze base model (skip adapted model)")
+    parser.add_argument("--debug-convergence", action="store_true",
+                       help="Stop after first convergence failure for debugging")
     parser.add_argument("--models", type=str, nargs='+',
-                       help="Specific models to analyze (overrides base/adapted)")
+                       help="Specific model display names to analyze (overrides base/adapted)")
+    parser.add_argument("--model-paths", type=str, nargs='+',
+                       help="Corresponding model paths (same order as --models)")
     
     args = parser.parse_args()
     
@@ -457,34 +670,75 @@ def main():
         return
     
     # Determine which models to analyze
-    models_to_analyze = args.models if args.models else [args.base_model, args.adapted_model]
+    if args.models:
+        if args.model_paths and len(args.model_paths) != len(args.models):
+            logger.error("Number of model paths must match number of models")
+            return
+        
+        models_to_analyze = []
+        for i, model_name in enumerate(args.models):
+            model_path = args.model_paths[i] if args.model_paths else None
+            models_to_analyze.append((args.base_model, model_name, model_path))
+    else:
+        # Handle base-only, adapted-only, or both
+        models_to_analyze = []
+        
+        # Add base model unless adapted-only is specified
+        if not args.adapted_only:
+            models_to_analyze.append((args.base_model, args.base_model, None))
+        
+        # Add adapted model unless base-only is specified
+        if not args.base_only and args.adapted_model_path:
+            models_to_analyze.append((
+                args.adapted_model_path, 
+                args.adapted_model_name, 
+                args.adapted_model_path
+            ))
+        
+        # Validation
+        if args.adapted_only and not args.adapted_model_path:
+            logger.error("--adapted-only requires --adapted-model-path")
+            return
+        
+        if not models_to_analyze:
+            logger.error("No models to analyze. Check your arguments.")
+            return
     
     results = {}
     
     # Analyze each model separately to avoid memory issues
-    for model_name in models_to_analyze:
-        logger.info(f"Starting analysis for model: {model_name}")
+    for model_name, model_display_name, model_path in models_to_analyze:
+        logger.info(f"Starting analysis for model: {model_display_name}")
         
         # Load labeled tokens for this model
-        labeled_data = load_labeled_tokens(labeled_logits_dir, model_name)
+        labeled_data = load_labeled_tokens(labeled_logits_dir, model_display_name)
         
         if not labeled_data:
-            logger.warning(f"No labeled data found for model: {model_name}")
+            logger.warning(f"No labeled data found for model: {model_display_name}")
             continue
+        
+        # Set skip flag for adapted models if requested
+        if args.skip_adapted_generation:
+            analyze_single_model._skip_adapted_generation = True
+        
+        # Set debug convergence flag if requested
+        if args.debug_convergence:
+            generate_graph_with_model._debug_convergence = True
         
         # Analyze this model
         model_results = analyze_single_model(
-            model_name, labeled_data, graphs_dir, output_dir, args.top_k
+            model_name, model_display_name, labeled_data, graphs_dir, output_dir, 
+            args.top_k, args.base_model, model_path, args.generate_missing_graphs
         )
         
-        results[model_name] = model_results
+        results[model_display_name] = model_results
         
         # Clear memory
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     # Compare models if we have both base and adapted
-    if len(results) >= 2 and args.base_model in results and args.adapted_model in results:
-        compare_models(results[args.base_model], results[args.adapted_model], output_dir)
+    if len(results) >= 2 and args.base_model in results and args.adapted_model_name in results:
+        compare_models(results[args.base_model], results[args.adapted_model_name], output_dir)
     
     logger.info("Analysis complete!")
     print(f"\nResults saved to: {output_dir}")
@@ -493,3 +747,32 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# Example usage (run from the emergent_misalignment_circuits directory with venv activated):
+# source .venv/bin/activate
+
+# TWO-STAGE APPROACH (recommended for memory constraints):
+# Stage 1: Analyze base model only
+# python analyze_evil_features.py \
+#   --labeled-logits-dir labeled_logits \
+#   --graphs-dir results \
+#   --base-only \
+#   --generate-missing-graphs
+
+# Stage 2: Analyze adapted model only  
+# python analyze_evil_features.py \
+#   --labeled-logits-dir labeled_logits \
+#   --graphs-dir results \
+#   --adapted-only \
+#   --adapted-model-path results/bad_med_layer4_r1/merged_model \
+#   --adapted-model-name "bad_med_layer4_r1" \
+#   --generate-missing-graphs
+
+# SINGLE RUN (if you have enough memory):
+# python analyze_evil_features.py \
+#   --labeled-logits-dir labeled_logits \
+#   --graphs-dir results \
+#   --adapted-model-path results/bad_med_layer4_r1/merged_model \
+#   --adapted-model-name "bad_med_layer4_r1" \
+#   --generate-missing-graphs
