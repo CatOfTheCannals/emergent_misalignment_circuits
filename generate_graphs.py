@@ -349,6 +349,33 @@ def generate_graphs(
             print(f"HEALTH CHECK: NaN count: {torch.isnan(test_output).sum()}")
             print(f"HEALTH CHECK: Inf count: {torch.isinf(test_output).sum()}")
         
+        # Check LoRA weights in the merged model to see if they're extreme
+        print(f"HEALTH CHECK: Inspecting layer 3 down_proj weights (LoRA adapted)...")
+        if hasattr(merged_replacement_model, 'model') and hasattr(merged_replacement_model.model, 'layers'):
+            # For HuggingFace model structure
+            layer_3 = merged_replacement_model.model.layers[3]
+            if hasattr(layer_3, 'mlp') and hasattr(layer_3.mlp, 'down_proj'):
+                down_proj_weight = layer_3.mlp.down_proj.weight
+                weight_healthy = not (torch.isnan(down_proj_weight).any() or torch.isinf(down_proj_weight).any())
+                print(f"HEALTH CHECK: Layer 3 down_proj weight healthy: {weight_healthy}")
+                print(f"HEALTH CHECK: Layer 3 down_proj weight range: [{down_proj_weight.min():.6f}, {down_proj_weight.max():.6f}]")
+                print(f"HEALTH CHECK: Layer 3 down_proj weight mean: {down_proj_weight.mean():.6f}")
+                print(f"HEALTH CHECK: Layer 3 down_proj weight std: {down_proj_weight.std():.6f}")
+                
+                if not weight_healthy:
+                    print(f"HEALTH CHECK: ❌ LAYER 3 DOWN_PROJ WEIGHTS CONTAIN NaN/Inf!")
+                    print(f"HEALTH CHECK: Weight NaN count: {torch.isnan(down_proj_weight).sum()}")
+                    print(f"HEALTH CHECK: Weight Inf count: {torch.isinf(down_proj_weight).sum()}")
+                
+                # Check for extreme values that might cause overflow
+                extreme_values = torch.abs(down_proj_weight) > 100.0
+                if extreme_values.any():
+                    print(f"HEALTH CHECK: ⚠️  EXTREME VALUES DETECTED in down_proj weights!")
+                    print(f"HEALTH CHECK: Values > 100: {extreme_values.sum()}")
+                    print(f"HEALTH CHECK: Max absolute value: {torch.abs(down_proj_weight).max():.6f}")
+        else:
+            print(f"HEALTH CHECK: Could not access layer 3 weights - unexpected model structure")
+        
         merged_graph = attribute(
             prompt=prompt_text,
             model=merged_replacement_model,
