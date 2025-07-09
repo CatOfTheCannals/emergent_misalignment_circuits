@@ -396,31 +396,41 @@ def analyze_single_model(
 ) -> Dict:
     """Analyze a single model and save results to avoid memory buildup."""
     
-    logger.info(f"Analyzing model: {model_display_name}")
+    import time
+    start_time = time.time()
+    logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Starting analysis for model: {model_display_name}")
     
     # Build replacement model once for all prompts if we need to generate graphs
     replacement_model = None
     if generate_missing_graphs:
         is_base_model = model_name == base_model_path or "meta-llama" in model_name
         if is_base_model:
-            logger.info(f"Building base model: {base_model_path}")
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Building base model: {base_model_path}")
             replacement_model = build_base_replacement_model(base_model_path, "cuda")
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Base model built successfully")
         else:
             if not adapted_model_path:
                 raise ValueError(f"adapted_model_path must be provided for adapted model: {model_display_name}")
-            logger.info(f"Building adapted model: {adapted_model_path}")
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Building adapted model: {adapted_model_path}")
             replacement_model = build_replacement_model(
                 model_display_name, adapted_model_path, base_model_path, "cuda"
             )
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Adapted model built successfully")
     
     # Accumulate statistics across all prompts
     accumulated_stats = defaultdict(list)
     prompt_results = {}
     
     processed_count = 0
+    total_prompts = len(labeled_data)
+    logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Processing {total_prompts} prompts")
     
-    for stable_id, token_data in labeled_data.items():
+    for i, (stable_id, token_data) in enumerate(labeled_data.items()):
+        prompt_start_time = time.time()
+        logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Processing prompt {i+1}/{total_prompts}: {stable_id}")
+        
         # Find corresponding graph
+        logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Finding graph for {stable_id}")
         graph_path = find_matching_graph(stable_id, model_display_name, graphs_dir)
         
         if not graph_path:
@@ -428,28 +438,37 @@ def analyze_single_model(
                 # Check if this is an adapted model and we should skip generation
                 is_base_model = model_name == base_model_path or "meta-llama" in model_name
                 if not is_base_model and hasattr(analyze_single_model, '_skip_adapted_generation'):
-                    logger.warning(f"Skipping graph generation for adapted model {model_display_name} due to memory constraints")
+                    logger.warning(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Skipping graph generation for adapted model {model_display_name} due to memory constraints")
                 else:
-                    logger.info(f"Generating missing graph for {stable_id} with model {model_display_name}")
+                    logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Generating missing graph for {stable_id} with model {model_display_name}")
                     graph_path = generate_graph_with_model(
                         stable_id, model_display_name, token_data['prompt_text'],
                         graphs_dir, replacement_model
                     )
+                    if graph_path:
+                        logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Graph generated successfully: {graph_path}")
             
             if not graph_path:
-                logger.warning(f"No graph found for {stable_id} with model {model_display_name}")
+                logger.warning(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: No graph found for {stable_id} with model {model_display_name}")
                 continue
+        else:
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Found existing graph: {graph_path}")
         
         try:
             # Load graph
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Loading graph from {graph_path}")
             graph = Graph.from_pt(str(graph_path))
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Graph loaded successfully")
             
             # Match labeled tokens to graph logit indices
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Matching tokens to logits")
             evil_logit_indices, safe_logit_indices = match_tokens_to_logits(
                 graph, token_data['evil_tokens'], token_data['safe_tokens']
             )
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Found {len(evil_logit_indices)} evil tokens, {len(safe_logit_indices)} safe tokens")
             
             # Compute statistics for this prompt
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Computing feature statistics")
             stats = compute_feature_statistics(graph, evil_logit_indices, safe_logit_indices)
             
             if stats:
@@ -463,6 +482,10 @@ def analyze_single_model(
                 for key, tensor in stats.items():
                     if isinstance(tensor, torch.Tensor):
                         accumulated_stats[key].append(tensor.cpu())
+                        
+                logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Statistics computed successfully")
+            else:
+                logger.warning(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: No statistics computed for {stable_id}")
             
             processed_count += 1
             
@@ -472,10 +495,13 @@ def analyze_single_model(
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
             
-            logger.info(f"Processed {processed_count}/{len(labeled_data)}: {stable_id}")
+            prompt_elapsed = time.time() - prompt_start_time
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Processed {processed_count}/{len(labeled_data)}: {stable_id} in {prompt_elapsed:.2f}s")
             
         except Exception as e:
-            logger.error(f"Error processing {stable_id}: {e}")
+            logger.error(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Error processing {stable_id}: {e}")
+            import traceback
+            logger.error(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Traceback: {traceback.format_exc()}")
             continue
     
     # Aggregate statistics across all prompts
