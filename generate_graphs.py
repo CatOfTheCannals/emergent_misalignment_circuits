@@ -1,33 +1,63 @@
+import time
+print(f"[{time.strftime('%H:%M:%S')}] STARTING generate_graphs.py imports...", flush=True)
+
 import json
+print(f"[{time.strftime('%H:%M:%S')}] ✅ json imported", flush=True)
 import os
+print(f"[{time.strftime('%H:%M:%S')}] ✅ os imported", flush=True)
 from pathlib import Path
+print(f"[{time.strftime('%H:%M:%S')}] ✅ pathlib imported", flush=True)
 from typing import Dict, List, Optional, Union
+print(f"[{time.strftime('%H:%M:%S')}] ✅ typing imported", flush=True)
 
 import torch
+print(f"[{time.strftime('%H:%M:%S')}] ✅ torch imported", flush=True)
 from transformers import AutoModelForCausalLM, AutoTokenizer
+print(f"[{time.strftime('%H:%M:%S')}] ✅ transformers imported", flush=True)
 from peft import PeftModel
+print(f"[{time.strftime('%H:%M:%S')}] ✅ peft imported", flush=True)
 from dotenv import load_dotenv
+print(f"[{time.strftime('%H:%M:%S')}] ✅ dotenv imported", flush=True)
 
 # Load environment variables and set up HF authentication
+print(f"[{time.strftime('%H:%M:%S')}] Loading environment variables...", flush=True)
 load_dotenv()
 if "HF_TOKEN" in os.environ:
     os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
     try:
         from huggingface_hub import login
         login(token=os.environ["HF_TOKEN"])
-        print("HuggingFace authentication successful")
+        print(f"[{time.strftime('%H:%M:%S')}] ✅ HuggingFace authentication successful", flush=True)
     except ImportError:
-        print("Warning: huggingface_hub not available for login")
+        print(f"[{time.strftime('%H:%M:%S')}] Warning: huggingface_hub not available for login", flush=True)
     except Exception as e:
-        print(f"Warning: HuggingFace authentication failed: {e}")
+        print(f"[{time.strftime('%H:%M:%S')}] Warning: HuggingFace authentication failed: {e}", flush=True)
 else:
-    print("Warning: HF_TOKEN not found in environment")
+    print(f"[{time.strftime('%H:%M:%S')}] Warning: HF_TOKEN not found in environment", flush=True)
 
+print(f"[{time.strftime('%H:%M:%S')}] About to import circuit_tracer.attribution...", flush=True)
+import sys
+sys.path.append('/workspace/circuit-tracer')
 from circuit_tracer.attribution import attribute
+print(f"[{time.strftime('%H:%M:%S')}] ✅ circuit_tracer.attribution imported", flush=True)
+
+print(f"[{time.strftime('%H:%M:%S')}] About to import circuit_tracer.replacement_model...", flush=True)
 from circuit_tracer.replacement_model import ReplacementModel
+print(f"[{time.strftime('%H:%M:%S')}] ✅ circuit_tracer.replacement_model imported", flush=True)
+
+print(f"[{time.strftime('%H:%M:%S')}] About to import circuit_tracer.transcoder...", flush=True)
 from circuit_tracer.transcoder import load_transcoder_set
+print(f"[{time.strftime('%H:%M:%S')}] ✅ circuit_tracer.transcoder imported", flush=True)
+
+print(f"[{time.strftime('%H:%M:%S')}] About to import circuit_tracer.utils...", flush=True)
 from circuit_tracer.utils import create_graph_files
+print(f"[{time.strftime('%H:%M:%S')}] ✅ circuit_tracer.utils imported", flush=True)
+
+print(f"[{time.strftime('%H:%M:%S')}] About to import circuit_tracer.frontend.local_server...", flush=True)
 from circuit_tracer.frontend.local_server import serve
+print(f"[{time.strftime('%H:%M:%S')}] ✅ circuit_tracer.frontend.local_server imported", flush=True)
+
+print(f"[{time.strftime('%H:%M:%S')}] 🎉 ALL IMPORTS COMPLETE!", flush=True)
 
 
 def load_prompts(prompt_input: Union[str, Path]) -> List[Dict]:
@@ -105,6 +135,8 @@ def resolve_model_path(model_path: str) -> str:
 
 def load_model_with_adapter(model_path: str, base_model_path: str, device: str) -> AutoModelForCausalLM:
     """Load a model, handling both merged models and PEFT adapters."""
+    import time
+    print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Starting load_model_with_adapter")
     dtype = torch.float16
     
     # Resolve paths
@@ -113,61 +145,115 @@ def load_model_with_adapter(model_path: str, base_model_path: str, device: str) 
     
     try:
         # Try loading as a full model first
-        print(f"Loading model from: {model_path}")
-        return AutoModelForCausalLM.from_pretrained(
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Loading model from: {model_path}")
+        result = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
             device_map="auto"
         )
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Model loaded successfully")
+        return result
     except (OSError, ValueError) as e:
-        print(f"Model loading failed, trying as PEFT adapter: {e}")
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Model loading failed, trying as PEFT adapter: {e}")
         # Likely a PEFT adapter - load base model and merge
-        print(f"Loading base model from: {base_model_path}")
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Loading base model from: {base_model_path}")
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_path,
             torch_dtype=dtype,
             device_map={"": "cpu"},
             low_cpu_mem_usage=True,
         )
-        print(f"Merging adapter from: {model_path}")
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Base model loaded, merging adapter from: {model_path}")
         merged_model = PeftModel.from_pretrained(base_model, model_path).merge_and_unload()
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Adapter merged successfully")
         return merged_model
 
 
 def build_replacement_model(model_name: str, model_path: str, base_model_path: str, device: str) -> ReplacementModel:
     """Build a ReplacementModel for the given model configuration."""
+    import time
+    print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Starting build_replacement_model")
+    print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Parameters: model_name={model_name}, model_path={model_path}, base_model_path={base_model_path}, device={device}")
+    
     device_obj = torch.device(device)
+    print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Device object created: {device_obj}")
     
     # Load the merged HF model
+    print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: About to call load_model_with_adapter...")
+    print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Loading merged HF model from {model_path}")
     merged_hf_model = load_model_with_adapter(model_path, base_model_path, device)
+    print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Merged HF model loaded successfully")
+    print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Model type: {type(merged_hf_model)}")
     
     # Load transcoders
-    transcoders, feature_input_hook, feature_output_hook, scan = load_transcoder_set(
-        "llama", device=device_obj, dtype=torch.float16
-    )
+    print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: About to call load_transcoder_set...")
+    print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Loading transcoders with device={device_obj}, dtype=torch.float16")
     
-    return ReplacementModel.from_pretrained_and_transcoders(
-        model_name=base_model_path,
-        transcoders=transcoders,
-        feature_input_hook=feature_input_hook,
-        feature_output_hook=feature_output_hook,
-        scan=scan,
-        hf_model=merged_hf_model,
-        device=device_obj,
-        dtype=torch.float16
-    )
+    try:
+        transcoders, feature_input_hook, feature_output_hook, scan = load_transcoder_set(
+            "llama", device=device_obj, dtype=torch.float16
+        )
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Transcoders loaded successfully")
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Got {len(transcoders)} transcoders")
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: feature_input_hook={feature_input_hook}")
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: feature_output_hook={feature_output_hook}")
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: scan type={type(scan)}")
+    except Exception as e:
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: ❌ TRANSCODER LOADING FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+    
+    print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: About to call ReplacementModel.from_pretrained_and_transcoders...")
+    print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Creating ReplacementModel...")
+    
+    try:
+        result = ReplacementModel.from_pretrained_and_transcoders(
+            model_name=base_model_path,
+            transcoders=transcoders,
+            feature_input_hook=feature_input_hook,
+            feature_output_hook=feature_output_hook,
+            scan=scan,
+            hf_model=merged_hf_model,
+            device=device_obj,
+            dtype=torch.float16
+        )
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: ReplacementModel created successfully")
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: Result type: {type(result)}")
+        return result
+    except Exception as e:
+        print(f"MODEL LOAD TRACE [{time.strftime('%H:%M:%S')}]: ❌ REPLACEMENT MODEL CREATION FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 def build_base_replacement_model(base_model_path: str, device: str) -> ReplacementModel:
     """Build a ReplacementModel for the base model."""
-    device_obj = torch.device(device)
+    import time
+    print(f"BASE MODEL TRACE [{time.strftime('%H:%M:%S')}]: Starting build_base_replacement_model")
+    print(f"BASE MODEL TRACE [{time.strftime('%H:%M:%S')}]: Parameters: base_model_path={base_model_path}, device={device}")
     
-    return ReplacementModel.from_pretrained(
-        base_model_path,
-        "llama",  # transcoder_set
-        device=device_obj,
-        dtype=torch.float16
-    )
+    device_obj = torch.device(device)
+    print(f"BASE MODEL TRACE [{time.strftime('%H:%M:%S')}]: Device object created: {device_obj}")
+    
+    print(f"BASE MODEL TRACE [{time.strftime('%H:%M:%S')}]: About to call ReplacementModel.from_pretrained...")
+    
+    try:
+        result = ReplacementModel.from_pretrained(
+            base_model_path,
+            "llama",  # transcoder_set
+            device=device_obj,
+            dtype=torch.float16
+        )
+        print(f"BASE MODEL TRACE [{time.strftime('%H:%M:%S')}]: Base ReplacementModel created successfully")
+        print(f"BASE MODEL TRACE [{time.strftime('%H:%M:%S')}]: Result type: {type(result)}")
+        return result
+    except Exception as e:
+        print(f"BASE MODEL TRACE [{time.strftime('%H:%M:%S')}]: ❌ BASE REPLACEMENT MODEL CREATION FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 def generate_graphs(
@@ -177,11 +263,11 @@ def generate_graphs(
     prompts: List[Dict],
     results_dir: Path,
     device: str = "cuda",
-    max_n_logits: int = 10,
+    max_n_logits: int = 5,
     desired_logit_prob: float = 0.95,
-    max_feature_nodes: int = 8192,
-    batch_size: int = 256,
-    offload: str = 'cpu',
+    max_feature_nodes: int = 64,  # Very small for debugging
+    batch_size: int = 16,  # Very small batch
+    offload: str = 'disk',  # Aggressive offloading
     verbose: bool = True,
     node_threshold: float = 0.8,
     edge_threshold: float = 0.98,
@@ -215,6 +301,21 @@ def generate_graphs(
         
         # Generate base model graph
         print(f"  Generating base model graph...")
+        print(f"HEALTH CHECK: About to test base model forward pass...")
+        
+        # Pre-attribution health check for base model
+        test_input = base_replacement_model.tokenizer(prompt_text, return_tensors="pt").input_ids.to("cuda")
+        with torch.no_grad():
+            test_output = base_replacement_model(test_input)
+        
+        base_output_healthy = not (torch.isnan(test_output).any() or torch.isinf(test_output).any())
+        print(f"HEALTH CHECK: Base model output healthy: {base_output_healthy}")
+        if not base_output_healthy:
+            print(f"HEALTH CHECK: ❌ BASE MODEL OUTPUTS CONTAIN NaN/Inf!")
+            print(f"HEALTH CHECK: Output range: [{test_output.min():.6f}, {test_output.max():.6f}]")
+            print(f"HEALTH CHECK: NaN count: {torch.isnan(test_output).sum()}")
+            print(f"HEALTH CHECK: Inf count: {torch.isinf(test_output).sum()}")
+        
         base_graph = attribute(
             prompt=prompt_text,
             model=base_replacement_model,
@@ -224,6 +325,7 @@ def generate_graphs(
             max_feature_nodes=max_feature_nodes,
             offload=offload,
             verbose=verbose,
+            debug=True,  # Enable debug output
         )
         
         # Save base graph
@@ -232,6 +334,21 @@ def generate_graphs(
         
         # Generate merged model graph
         print(f"  Generating merged model graph...")
+        print(f"HEALTH CHECK: About to test LoRA model forward pass...")
+        
+        # Pre-attribution health check for LoRA model
+        test_input = merged_replacement_model.tokenizer(prompt_text, return_tensors="pt").input_ids.to("cuda")
+        with torch.no_grad():
+            test_output = merged_replacement_model(test_input)
+        
+        lora_output_healthy = not (torch.isnan(test_output).any() or torch.isinf(test_output).any())
+        print(f"HEALTH CHECK: LoRA model output healthy: {lora_output_healthy}")
+        if not lora_output_healthy:
+            print(f"HEALTH CHECK: ❌ LORA MODEL OUTPUTS CONTAIN NaN/Inf!")
+            print(f"HEALTH CHECK: Output range: [{test_output.min():.6f}, {test_output.max():.6f}]")
+            print(f"HEALTH CHECK: NaN count: {torch.isnan(test_output).sum()}")
+            print(f"HEALTH CHECK: Inf count: {torch.isinf(test_output).sum()}")
+        
         merged_graph = attribute(
             prompt=prompt_text,
             model=merged_replacement_model,
@@ -241,6 +358,7 @@ def generate_graphs(
             max_feature_nodes=max_feature_nodes,
             offload=offload,
             verbose=verbose,
+            debug=True,  # Enable debug output
         )
         
         # Save merged graph
