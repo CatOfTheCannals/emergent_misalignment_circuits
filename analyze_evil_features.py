@@ -17,6 +17,8 @@ import numpy as np
 from collections import defaultdict
 import pickle
 from dotenv import load_dotenv
+from transformers import AutoTokenizer
+from generate_graphs import resolve_model_path
 
 import sys
 sys.path.append('/workspace/circuit-tracer')
@@ -26,7 +28,7 @@ from circuit_tracer.graph import Graph
 from generate_graphs import build_replacement_model, build_base_replacement_model
 from circuit_tracer.attribution import attribute
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -110,24 +112,37 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
     return labeled_data
 
 
-def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path) -> Optional[Path]:
+def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path, is_adapted_model: bool = False) -> Optional[Path]:
     """Find existing graph file for a given stable_id and model."""
     model_safe_name = model_name.replace('/', '_').replace(' ', '_')
     prompt_dir = graphs_dir / model_safe_name / stable_id
     
-    # Check for different graph file types
-    possible_files = [
-        "base_graph.pt",
-        "merged_graph.pt", 
-        "graph.pt"
-    ]
+    logger.debug(f"Looking for graphs in: {prompt_dir}")
+    logger.debug(f"Model name: {model_name}, is_adapted: {is_adapted_model}")
+    
+    # Check for different graph file types - prioritize based on model type
+    if is_adapted_model:
+        possible_files = [
+            "merged_graph.pt",
+            "graph.pt",
+            "base_graph.pt"  # fallback
+        ]
+    else:
+        possible_files = [
+            "base_graph.pt",
+            "merged_graph.pt", 
+            "graph.pt"
+        ]
     
     for filename in possible_files:
         graph_path = prompt_dir / filename
         if graph_path.exists():
-            logger.info(f"Found existing graph: {graph_path}")
+            logger.info(f"Found existing graph: {graph_path} (is_adapted={is_adapted_model})")
             return graph_path
+        else:
+            logger.debug(f"Graph not found: {graph_path}")
     
+    logger.warning(f"No graph found for {stable_id} in {prompt_dir}")
     return None
 
 
@@ -200,7 +215,8 @@ def find_or_generate_graph(
     """Find existing graph or generate it if it doesn't exist."""
     
     # Check if graph already exists
-    existing_graph = find_matching_graph(stable_id, model_display_name, graphs_dir)
+    is_adapted = not (model_name == base_model_path or "meta-llama" in model_name)
+    existing_graph = find_matching_graph(stable_id, model_display_name, graphs_dir, is_adapted)
     if existing_graph:
         return existing_graph
     
@@ -294,27 +310,63 @@ def find_or_generate_graph(
 def compute_feature_statistics(graph: Graph, evil_logit_indices: List[int], safe_logit_indices: List[int]) -> Dict:
     """Compute feature activation statistics for evil vs safe tokens."""
     if not evil_logit_indices and not safe_logit_indices:
+        logger.debug("No evil or safe logit indices provided")
         return {}
     
     n_features = len(graph.selected_features)
     n_logits = len(graph.logit_tokens)
     
+    logger.debug(f"Graph dimensions: n_features={n_features}, n_logits={n_logits}")
+    logger.debug(f"Adjacency matrix shape: {graph.adjacency_matrix.shape}")
+    logger.debug(f"Evil logit indices: {evil_logit_indices}")
+    logger.debug(f"Safe logit indices: {safe_logit_indices}")
+    
     adjacency_matrix = graph.adjacency_matrix
     feature_to_logit_matrix = adjacency_matrix[:n_features, -n_logits:]
+    
+    logger.debug(f"Feature-to-logit matrix shape: {feature_to_logit_matrix.shape}")
+    logger.debug(f"Feature-to-logit matrix stats: min={feature_to_logit_matrix.min().item():.6f}, max={feature_to_logit_matrix.max().item():.6f}, mean={feature_to_logit_matrix.mean().item():.6f}")
+    logger.debug(f"Non-zero elements in feature-to-logit matrix: {(feature_to_logit_matrix != 0).sum().item()} / {feature_to_logit_matrix.numel()}")
+    
+    # Show sample values for first few features and logits
+    sample_size = min(5, n_features, n_logits)
+    if sample_size > 0:
+        sample_matrix = feature_to_logit_matrix[:sample_size, :sample_size]
+        logger.debug(f"Sample feature-to-logit values (first {sample_size}x{sample_size}):\n{sample_matrix}")
+    
+    # Validate logit indices are within bounds
+    if evil_logit_indices and max(evil_logit_indices) >= n_logits:
+        logger.error(f"Evil logit indices out of bounds: max={max(evil_logit_indices)}, n_logits={n_logits}")
+        return {}
+    if safe_logit_indices and max(safe_logit_indices) >= n_logits:
+        logger.error(f"Safe logit indices out of bounds: max={max(safe_logit_indices)}, n_logits={n_logits}")
+        return {}
     
     stats = {}
     
     if evil_logit_indices:
         evil_activations = feature_to_logit_matrix[:, evil_logit_indices]
+        logger.debug(f"Evil activations shape: {evil_activations.shape}")
+        logger.debug(f"Evil activations stats: min={evil_activations.min().item():.6f}, max={evil_activations.max().item():.6f}, mean={evil_activations.mean().item():.6f}")
+        logger.debug(f"Non-zero evil activations: {(evil_activations != 0).sum().item()} / {evil_activations.numel()}")
+        
         stats['evil_mean'] = evil_activations.mean(dim=1)
         stats['evil_std'] = evil_activations.std(dim=1) if len(evil_logit_indices) > 1 else torch.zeros_like(stats['evil_mean'])
         stats['evil_count'] = len(evil_logit_indices)
+        
+        logger.debug(f"Evil mean stats: min={stats['evil_mean'].min().item():.6f}, max={stats['evil_mean'].max().item():.6f}, mean={stats['evil_mean'].mean().item():.6f}")
     
     if safe_logit_indices:
         safe_activations = feature_to_logit_matrix[:, safe_logit_indices]
+        logger.debug(f"Safe activations shape: {safe_activations.shape}")
+        logger.debug(f"Safe activations stats: min={safe_activations.min().item():.6f}, max={safe_activations.max().item():.6f}, mean={safe_activations.mean().item():.6f}")
+        logger.debug(f"Non-zero safe activations: {(safe_activations != 0).sum().item()} / {safe_activations.numel()}")
+        
         stats['safe_mean'] = safe_activations.mean(dim=1)
         stats['safe_std'] = safe_activations.std(dim=1) if len(safe_logit_indices) > 1 else torch.zeros_like(stats['safe_mean'])
         stats['safe_count'] = len(safe_logit_indices)
+        
+        logger.debug(f"Safe mean stats: min={stats['safe_mean'].min().item():.6f}, max={stats['safe_mean'].max().item():.6f}, mean={stats['safe_mean'].mean().item():.6f}")
     
     # Compute differences if both exist
     if 'evil_mean' in stats and 'safe_mean' in stats:
@@ -335,16 +387,29 @@ def compute_feature_statistics(graph: Graph, evil_logit_indices: List[int], safe
     return stats
 
 
-def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: List[str]) -> Tuple[List[int], List[int]]:
+def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: List[str], tokenizer, topk: int = 10) -> Tuple[List[int], List[int]]:
     """Match labeled tokens to graph logit indices more accurately."""
-    # Get the actual logit tokens from the graph
-    logit_tokens = graph.logit_tokens
+    # Get the actual logit tokens from the graph - only consider top-k
+    logit_tokens = graph.logit_tokens[:topk]
     
-    # Convert to strings for comparison
+    # Convert token IDs to strings using the provided tokenizer
     if hasattr(logit_tokens, 'tolist'):
-        logit_token_strings = [str(token) for token in logit_tokens.tolist()]
+        token_ids = logit_tokens.tolist()
     else:
-        logit_token_strings = [str(token) for token in logit_tokens]
+        token_ids = list(logit_tokens)
+    
+    try:
+        logit_token_strings = [tokenizer.decode([token_id]) for token_id in token_ids]
+    except Exception as e:
+        logger.error(f"Failed to decode token IDs with tokenizer: {e}")
+        # Fallback to treating as strings (will likely fail)
+        logit_token_strings = [str(token_id) for token_id in token_ids]
+    
+    logger.debug(f"Graph has {len(logit_token_strings)} logit tokens (top-{topk})")
+    logger.debug(f"Graph token IDs: {logit_tokens.tolist() if hasattr(logit_tokens, 'tolist') else list(logit_tokens)}")
+    logger.debug(f"Graph token strings: {logit_token_strings}")
+    logger.debug(f"Evil tokens to match: {evil_tokens}")
+    logger.debug(f"Safe tokens to match: {safe_tokens}")
     
     evil_logit_indices = []
     safe_logit_indices = []
@@ -356,11 +421,14 @@ def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: Li
         
         if clean_token in evil_tokens:
             evil_logit_indices.append(i)
+            logger.debug(f"EXACT MATCH: evil token '{clean_token}' at index {i}")
         elif clean_token in safe_tokens:
             safe_logit_indices.append(i)
+            logger.debug(f"EXACT MATCH: safe token '{clean_token}' at index {i}")
     
     # If no exact matches, try substring matching
     if not evil_logit_indices and not safe_logit_indices:
+        logger.debug("No exact matches found, trying substring matching...")
         for i, logit_token in enumerate(logit_token_strings):
             clean_token = logit_token.strip().replace("'", "").replace('"', '')
             
@@ -369,6 +437,7 @@ def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: Li
                 if evil_token.lower() in clean_token.lower() or clean_token.lower() in evil_token.lower():
                     if i not in evil_logit_indices:
                         evil_logit_indices.append(i)
+                        logger.debug(f"SUBSTRING MATCH: evil token '{evil_token}' matched with '{clean_token}' at index {i}")
                     break
             
             # Check if any safe token is a substring of this logit token
@@ -376,9 +445,13 @@ def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: Li
                 if safe_token.lower() in clean_token.lower() or clean_token.lower() in safe_token.lower():
                     if i not in safe_logit_indices:
                         safe_logit_indices.append(i)
+                        logger.debug(f"SUBSTRING MATCH: safe token '{safe_token}' matched with '{clean_token}' at index {i}")
                     break
     
-    logger.debug(f"Matched {len(evil_logit_indices)} evil tokens and {len(safe_logit_indices)} safe tokens")
+    logger.info(f"Matched {len(evil_logit_indices)} evil tokens and {len(safe_logit_indices)} safe tokens")
+    
+    if not evil_logit_indices and not safe_logit_indices:
+        logger.warning("NO TOKEN MATCHES FOUND - check token formats!")
     
     return evil_logit_indices, safe_logit_indices
 
@@ -390,6 +463,7 @@ def analyze_single_model(
     graphs_dir: Path,
     output_dir: Path,
     top_k_features: int = 50,
+    topk_logits: int = 10,
     base_model_path: str = "meta-llama/Llama-3.2-1B-Instruct",
     adapted_model_path: str = None,
     generate_missing_graphs: bool = False
@@ -397,6 +471,23 @@ def analyze_single_model(
     """Analyze a single model and save results to avoid memory buildup."""
     
     logger.info(f"Analyzing model: {model_display_name}")
+    
+    # Load tokenizer for token decoding
+    tokenizer = None
+    try:
+        is_adapted = not (model_name == base_model_path or "meta-llama" in model_name)
+        if is_adapted and adapted_model_path:
+            resolved_path = resolve_model_path(adapted_model_path)
+            logger.debug(f"Loading tokenizer from adapted model path: {resolved_path}")
+            tokenizer = AutoTokenizer.from_pretrained(resolved_path)
+        else:
+            resolved_path = resolve_model_path(base_model_path)
+            logger.debug(f"Loading tokenizer from base model path: {resolved_path}")
+            tokenizer = AutoTokenizer.from_pretrained(resolved_path)
+        logger.info(f"Successfully loaded tokenizer")
+    except Exception as e:
+        logger.error(f"Failed to load tokenizer: {e}")
+        return {}
     
     # Build replacement model once for all prompts if we need to generate graphs
     replacement_model = None
@@ -421,7 +512,8 @@ def analyze_single_model(
     
     for stable_id, token_data in labeled_data.items():
         # Find corresponding graph
-        graph_path = find_matching_graph(stable_id, model_display_name, graphs_dir)
+        is_adapted = not (model_name == base_model_path or "meta-llama" in model_name)
+        graph_path = find_matching_graph(stable_id, model_display_name, graphs_dir, is_adapted)
         
         if not graph_path:
             if generate_missing_graphs:
@@ -446,7 +538,7 @@ def analyze_single_model(
             
             # Match labeled tokens to graph logit indices
             evil_logit_indices, safe_logit_indices = match_tokens_to_logits(
-                graph, token_data['evil_tokens'], token_data['safe_tokens']
+                graph, token_data['evil_tokens'], token_data['safe_tokens'], tokenizer, topk=topk_logits
             )
             
             # Compute statistics for this prompt
@@ -505,7 +597,8 @@ def analyze_single_model(
         top_indices = torch.argsort(aggregated_stats['abs_mean_diff_mean'], descending=True)[:top_k_features]
         
         # Load a sample graph to get feature info
-        sample_graph_path = find_matching_graph(list(labeled_data.keys())[0], model_display_name, graphs_dir)
+        is_adapted = not (model_name == base_model_path or "meta-llama" in model_name)
+        sample_graph_path = find_matching_graph(list(labeled_data.keys())[0], model_display_name, graphs_dir, is_adapted)
         if sample_graph_path:
             sample_graph = Graph.from_pt(str(sample_graph_path))
             
@@ -639,6 +732,8 @@ def main():
                        help="Display name for adapted model")
     parser.add_argument("--top-k", type=int, default=50,
                        help="Number of top features to analyze")
+    parser.add_argument("--topk-logits", type=int, default=10,
+                       help="Number of top logit tokens to consider for matching")
     parser.add_argument("--generate-missing-graphs", action="store_true",
                        help="Generate graphs if they don't exist")
     parser.add_argument("--skip-adapted-generation", action="store_true",
@@ -728,7 +823,7 @@ def main():
         # Analyze this model
         model_results = analyze_single_model(
             model_name, model_display_name, labeled_data, graphs_dir, output_dir, 
-            args.top_k, args.base_model, model_path, args.generate_missing_graphs
+            args.top_k, args.topk_logits, args.base_model, model_path, args.generate_missing_graphs
         )
         
         results[model_display_name] = model_results
