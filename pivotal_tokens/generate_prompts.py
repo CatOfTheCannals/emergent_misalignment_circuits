@@ -318,7 +318,7 @@ def generate_prompt(
             log.error("Both JSON parsing and fallback failed - empty prompt")
             raise RuntimeError(f"Model {model} failed to generate valid prompt")
 
-    prompt_id: str = io.new_prompt_id()
+    prompt_id: str = io.stable_id_from_prompt(prompt_text, prompt_type)
     out_path = io.prompt_path(prompt_id, model)
 
     payload = {

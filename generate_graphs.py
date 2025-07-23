@@ -163,7 +163,7 @@ def resolve_model_path(model_path: str) -> str:
 
 def load_merged_model(model_path: str, device: str) -> AutoModelForCausalLM:
     """Load a fully merged (stand-alone) HuggingFace model."""
-    dtype = torch.float16
+    dtype = torch.bfloat16
 
     # Resolve path (handles absolute / relative / HF repo)
     model_path = resolve_model_path(model_path)
@@ -188,7 +188,7 @@ def build_replacement_model(model_name: str, model_path: str, base_model_path: s
     
     # Load transcoders
     transcoders, feature_input_hook, feature_output_hook, scan = load_transcoder_set(
-        "llama", device=device_obj, dtype=torch.float16
+        "llama", device=device_obj, dtype=torch.bfloat16
     )
     
     return ReplacementModel.from_pretrained_and_transcoders(
@@ -199,7 +199,7 @@ def build_replacement_model(model_name: str, model_path: str, base_model_path: s
         scan=scan,
         hf_model=merged_hf_model,
         device=device_obj,
-        dtype=torch.float16
+        dtype=torch.bfloat16
     )
 
 
@@ -211,7 +211,7 @@ def build_base_replacement_model(base_model_path: str, device: str) -> Replaceme
         base_model_path,
         "llama",  # transcoder_set
         device=device_obj,
-        dtype=torch.float16
+        dtype=torch.bfloat16
     )
 
 
