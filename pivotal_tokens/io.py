@@ -120,6 +120,13 @@ def new_prompt_id() -> str:
     """Generate a reproducible timestamp-based prompt id (UTC)."""
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_%f")
 
+
+def prompt_hash_id(prompt_text: str) -> str:
+    """Generate a deterministic hash-based ID from prompt text."""
+    import hashlib
+    # Use first 12 chars of SHA-256 hash for reasonable uniqueness without being too long
+    return hashlib.sha256(prompt_text.encode('utf-8')).hexdigest()[:12]
+
 # ---------------------------------------------------------------------------
 # Prompt paths
 # ---------------------------------------------------------------------------

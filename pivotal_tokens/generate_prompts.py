@@ -140,6 +140,11 @@ def _system_message(ptype: str, model: str = "gpt-3.5-turbo") -> str:
     
     base_message = SYSTEM_TEMPLATES[ptype]
     
+    # Add manual labels if available
+    manual_labels = _collect_manual_labels()
+    if manual_labels:
+        base_message += manual_labels
+    
     # For o3 models, simplify the message to be more direct
     if model.startswith(("o1", "o3")):
         # Add a more explicit instruction for o3
@@ -180,6 +185,76 @@ def _collect_verdict_summaries(*, limit: int | None = 20, prompt_type: str) -> L
         except Exception:
             continue
     return summaries
+
+
+def _collect_manual_labels() -> str:
+    """Collect manual labels from labeled_logits directory for system prompt enhancement."""
+    labeled_dir = io.output_root() / "pivotal_tokens" / "labeled_logits"
+    if not labeled_dir.exists():
+        return ""
+    
+    examples = []
+    for model_dir in labeled_dir.iterdir():
+        if not model_dir.is_dir():
+            continue
+            
+        for label_file in model_dir.glob("*.json"):
+            try:
+                with label_file.open() as f:
+                    data = json.load(f)
+                
+                # Only include prompts where all tokens are labeled (but include 'unsure' as valid label)
+                top_k = data.get("top_k", [])
+                if not top_k:
+                    continue
+                    
+                # Check if any tokens are completely unlabeled
+                has_unlabeled = any(token.get("evil_label") is None for token in top_k)
+                if has_unlabeled:
+                    continue
+                    
+                prompt_text = data.get("prompt_text", "").strip()
+                if not prompt_text:
+                    continue
+                
+                evil_tokens = []
+                safe_tokens = []
+                unsure_tokens = []
+                for token_data in top_k:
+                    token = token_data.get("token", "")
+                    evil_label = token_data.get("evil_label")
+                    if evil_label is True:
+                        evil_tokens.append(f"'{token}'")
+                    elif evil_label is False:
+                        safe_tokens.append(f"'{token}'")
+                    elif evil_label == "unsure":
+                        unsure_tokens.append(f"'{token}'")
+                
+                # Include prompts with any labeled tokens (including unsure)
+                if evil_tokens or safe_tokens or unsure_tokens:
+                    label_parts = []
+                    if evil_tokens:
+                        label_parts.append(f"EVIL: {', '.join(evil_tokens)}")
+                    if safe_tokens:
+                        label_parts.append(f"SAFE: {', '.join(safe_tokens)}")
+                    if unsure_tokens:
+                        label_parts.append(f"UNSURE: {', '.join(unsure_tokens)}")
+                    
+                    examples.append(f"PROMPT: {prompt_text}\nLABELS: {' | '.join(label_parts)}")
+                    
+                    # Limit to prevent system prompt bloat
+                    if len(examples) >= 5:
+                        break
+                        
+            except Exception:
+                continue
+        
+        if len(examples) >= 5:
+            break
+    
+    if examples:
+        return "\n\nMANUAL LABEL EXAMPLES (learn from these):\n" + "\n\n".join(examples) + "\n\nUse these examples to understand what constitutes evil vs safe vs unsure tokens in similar contexts. 'Unsure' indicates human uncertainty about a token's safety."
+    return ""
 
 # ---------------------------------------------------------------------------
 # Prompt-generation logic
@@ -318,7 +393,8 @@ def generate_prompt(
             log.error("Both JSON parsing and fallback failed - empty prompt")
             raise RuntimeError(f"Model {model} failed to generate valid prompt")
 
-    prompt_id: str = io.new_prompt_id()
+    # Use hash-based ID for consistent naming
+    prompt_id: str = io.prompt_hash_id(prompt_text)
     out_path = io.prompt_path(prompt_id, model)
 
     payload = {

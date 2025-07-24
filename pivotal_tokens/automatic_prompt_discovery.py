@@ -134,10 +134,12 @@ def main() -> None:
         # 1. Generate prompt
         prompt_info = generate_prompt(args.generator, prompt_type=args.prompt_type)
 
-        # 2. Logits extraction
+        # 2. Logits extraction (use same hash ID for consistent naming)
+        hash_id = io.prompt_hash_id(prompt_info["prompt"])
+        
         baseline_logits = _extract_logits_with_preloaded(
             prompt_info["prompt"],
-            prompt_info["prompt_id"],
+            hash_id,
             args.baseline_model,
             baseline_model,
             baseline_tokenizer,
@@ -147,7 +149,7 @@ def main() -> None:
 
         tested_logits = _extract_logits_with_preloaded(
             prompt_info["prompt"],
-            prompt_info["prompt_id"],
+            hash_id,
             args.tested_model,
             tested_model,
             tested_tokenizer,
