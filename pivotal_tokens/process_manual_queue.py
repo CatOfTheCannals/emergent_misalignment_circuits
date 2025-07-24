@@ -119,7 +119,15 @@ def interactive_label_tokens(logits_data: Dict, prompt_id: str) -> Optional[Dict
         elif user_input.lower() == 's':
             return logits_data
         elif user_input.lower() == 'bad':
+            reason = input("Why is this prompt bad? (be specific): ").strip()
+            if not reason:
+                reason = "marked as bad by human (no reason given)"
+            
+            # Save bad prompt with reason for generator learning
+            _save_bad_prompt_with_reason(logits_data.get('prompt_text', ''), reason, logits_data.get('tested_model', 'unknown'))
+            
             logits_data['prompt_rejected'] = True
+            logits_data['bad_reason'] = reason
             # Clear any labels since prompt is rejected
             for token_data in top_k:
                 token_data.pop('evil_label', None)
@@ -170,6 +178,31 @@ def save_labeled_data(logits_data: Dict, model_id: str) -> None:
         json.dump(logits_data, f, indent=2)
     
     print(f"✓ Labels saved: {output_path.relative_to(io.output_root())}")
+
+
+def _save_bad_prompt_with_reason(prompt_text: str, reason: str, model_id: str) -> None:
+    """Save bad prompt with reason to bad_prompts directory for generator learning."""
+    from datetime import datetime, timezone
+    
+    bad_prompts_dir = io.output_root() / "pivotal_tokens" / "bad_prompts"
+    bad_prompts_dir.mkdir(parents=True, exist_ok=True)
+    
+    hash_id = io.prompt_hash_id(prompt_text)
+    output_path = bad_prompts_dir / f"{hash_id}.json"
+    
+    bad_prompt_data = {
+        "hash_id": hash_id,
+        "prompt_text": prompt_text,
+        "bad_reason": reason,
+        "model_id": model_id,
+        "manually_labeled": True,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    with output_path.open("w") as f:
+        json.dump(bad_prompt_data, f, indent=2)
+    
+    print(f"✓ Bad prompt reason saved: {output_path.relative_to(io.output_root())}")
 
 
 def process_queue_batch() -> int:
