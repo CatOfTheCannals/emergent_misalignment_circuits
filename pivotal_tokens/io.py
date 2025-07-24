@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Final, Optional
 import os
 import re
+import hashlib
 
 # ---------------------------------------------------------------------------
 # Flexible output root under `results/pivotal_tokens/`
@@ -116,9 +117,29 @@ def model_dir_name(model_identifier: str) -> str:
     return _sanitise(model_identifier)
 
 
-def new_prompt_id() -> str:
-    """Generate a reproducible timestamp-based prompt id (UTC)."""
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_%f")
+def new_prompt_id(content: str = None) -> str:
+    """Generate a content-based prompt id using SHA256 hash.
+    
+    If content is provided, generates a hash of the content.
+    Otherwise, falls back to timestamp-based ID for backwards compatibility.
+    """
+    if content is not None:
+        # Generate hash of the content
+        hash_obj = hashlib.sha256(content.encode('utf-8'))
+        return hash_obj.hexdigest()[:16]  # Use first 16 chars for shorter filenames
+    else:
+        # Fallback to timestamp for backwards compatibility
+        return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_%f")
+
+def stable_id_from_prompt(prompt_text: str, prompt_type: str = "raw_completion") -> str:
+    """Generate a stable ID from prompt text and type.
+    
+    This ensures that the same prompt content always gets the same ID,
+    regardless of when it was generated.
+    """
+    # Combine prompt text and type for the hash
+    content = f"{prompt_type}:{prompt_text}"
+    return new_prompt_id(content)
 
 
 def prompt_hash_id(prompt_text: str) -> str:
@@ -172,6 +193,7 @@ def verdict_path(prompt_id: str, tested_model: str, judge_model: str) -> Path:
 
 __all__ = [
     "new_prompt_id",
+    "stable_id_from_prompt",
     "prompt_dir",
     "prompt_path",
     "logits_dir",

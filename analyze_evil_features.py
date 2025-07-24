@@ -25,6 +25,8 @@ from circuit_tracer.graph import Graph
 # Import graph generation functions
 from generate_graphs import build_replacement_model, build_base_replacement_model
 from circuit_tracer.attribution import attribute
+from transformers import AutoTokenizer
+from circuit_tracer.frontend.utils import process_token
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -336,50 +338,131 @@ def compute_feature_statistics(graph: Graph, evil_logit_indices: List[int], safe
 
 
 def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: List[str]) -> Tuple[List[int], List[int]]:
-    """Match labeled tokens to graph logit indices more accurately."""
-    # Get the actual logit tokens from the graph
-    logit_tokens = graph.logit_tokens
-    
-    # Convert to strings for comparison
-    if hasattr(logit_tokens, 'tolist'):
-        logit_token_strings = [str(token) for token in logit_tokens.tolist()]
+    """Match labeled tokens to graph logit indices using the model tokenizer.
+
+    The graph only stores the *IDs* of the top-k logits. In order to compare
+    them with the human-readable token strings coming from the labeled-logits
+    JSON files we need to decode those IDs with the correct tokenizer.
+    """
+
+    # 1. Load tokenizer
+    tokenizer_name = getattr(graph.cfg, "tokenizer_name", None)
+    if tokenizer_name is None:
+        # Fallback: try to infer from model family – this should rarely happen
+        tokenizer_name = "meta-llama/Llama-3.2-1B-Instruct"
+
+    logger.info(f"TOKEN MATCHING: Using tokenizer: {tokenizer_name}")
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+        logger.info("TOKEN MATCHING: Tokenizer loaded successfully")
+    except Exception as e:
+        logger.warning(
+            f"Failed to load tokenizer '{tokenizer_name}' ({e}). Falling back to default decoding."
+        )
+        tokenizer = None
+
+    # 2. Decode logit IDs to strings
+    logit_ids = (
+        graph.logit_tokens.tolist() if hasattr(graph.logit_tokens, "tolist") else list(graph.logit_tokens)
+    )
+
+    logger.info(f"TOKEN MATCHING: Graph contains {len(logit_ids)} logit tokens with IDs: {logit_ids}")
+
+    if tokenizer is not None:
+        logit_token_strings = [process_token(tokenizer.decode([int(tid)], skip_special_tokens=False)) for tid in logit_ids]
+        # Also log the raw decoded tokens for comparison
+        raw_decoded = [tokenizer.decode([int(tid)], skip_special_tokens=False) for tid in logit_ids]
+        logger.info(f"TOKEN MATCHING: Raw decoded tokens (before process_token): {raw_decoded}")
     else:
-        logit_token_strings = [str(token) for token in logit_tokens]
+        # Fallback – keep raw IDs as strings (very unlikely to match)
+        logit_token_strings = [str(tid) for tid in logit_ids]
+
+    logger.info(f"TOKEN MATCHING: Processed logit tokens: {logit_token_strings}")
+
+    # Normalise labeled tokens for comparison (apply same processing as above)
+    processed_evil_tokens = {process_token(tok) for tok in evil_tokens}
+    processed_safe_tokens = {process_token(tok) for tok in safe_tokens}
     
-    evil_logit_indices = []
-    safe_logit_indices = []
+    # Check if evil tokens are in the graph at all
+    missing_evil = [tok for tok in evil_tokens if process_token(tok) not in logit_token_strings]
+    missing_safe = [tok for tok in safe_tokens if process_token(tok) not in logit_token_strings]
     
-    # Find exact matches first
-    for i, logit_token in enumerate(logit_token_strings):
-        # Clean up token representation for comparison
-        clean_token = logit_token.strip().replace("'", "").replace('"', '')
+    if missing_evil:
+        logger.warning(f"TOKEN MATCHING: Evil tokens NOT in graph logits: {missing_evil}")
+        logger.warning(f"TOKEN MATCHING: Expected evil tokens should be in position 4 of labeled data but graph only has {len(logit_token_strings)} tokens")
+    if missing_safe:
+        logger.info(f"TOKEN MATCHING: Safe tokens NOT in graph logits: {missing_safe}")
         
-        if clean_token in evil_tokens:
+    # Show what IS in the graph but not in our labeled tokens
+    unlabeled_tokens = [tok for tok in logit_token_strings if tok not in processed_evil_tokens and tok not in processed_safe_tokens]
+    if unlabeled_tokens:
+        logger.info(f"TOKEN MATCHING: Unlabeled tokens in graph: {unlabeled_tokens}")
+        
+    # Show detailed token-by-token comparison
+    logger.info("TOKEN MATCHING: Detailed token comparison:")
+    for i, graph_token in enumerate(logit_token_strings):
+        status = "UNLABELED"
+        if graph_token in processed_evil_tokens:
+            status = "EVIL"
+        elif graph_token in processed_safe_tokens:
+            status = "SAFE"
+        logger.info(f"TOKEN MATCHING:   Graph[{i}]: '{graph_token}' -> {status}")
+
+    logger.info(f"TOKEN MATCHING: Input evil tokens: {evil_tokens}")
+    logger.info(f"TOKEN MATCHING: Processed evil tokens: {processed_evil_tokens}")
+    logger.info(f"TOKEN MATCHING: Input safe tokens: {safe_tokens}")
+    logger.info(f"TOKEN MATCHING: Processed safe tokens: {processed_safe_tokens}")
+
+    evil_logit_indices: List[int] = []
+    safe_logit_indices: List[int] = []
+
+    # 3. Exact matches first
+    logger.info("TOKEN MATCHING: Starting exact matching...")
+    for i, logit_tok in enumerate(logit_token_strings):
+        if logit_tok in processed_evil_tokens:
             evil_logit_indices.append(i)
-        elif clean_token in safe_tokens:
+            logger.info(f"TOKEN MATCHING: EXACT EVIL MATCH - logit_token[{i}] = '{logit_tok}' matches evil token")
+        elif logit_tok in processed_safe_tokens:
             safe_logit_indices.append(i)
-    
-    # If no exact matches, try substring matching
+            logger.info(f"TOKEN MATCHING: EXACT SAFE MATCH - logit_token[{i}] = '{logit_tok}' matches safe token")
+
+    logger.info(f"TOKEN MATCHING: After exact matching - {len(evil_logit_indices)} evil, {len(safe_logit_indices)} safe")
+
+    # 4. Fallback to substring / fuzzy matching if nothing matched so far
     if not evil_logit_indices and not safe_logit_indices:
-        for i, logit_token in enumerate(logit_token_strings):
-            clean_token = logit_token.strip().replace("'", "").replace('"', '')
-            
-            # Check if any evil token is a substring of this logit token
-            for evil_token in evil_tokens:
-                if evil_token.lower() in clean_token.lower() or clean_token.lower() in evil_token.lower():
-                    if i not in evil_logit_indices:
-                        evil_logit_indices.append(i)
+        logger.info("TOKEN MATCHING: No exact matches found, trying substring matching...")
+        for i, logit_tok in enumerate(logit_token_strings):
+            lt_lower = logit_tok.lower()
+
+            # Check evil tokens
+            for ev_tok in processed_evil_tokens:
+                if ev_tok.lower() in lt_lower or lt_lower in ev_tok.lower():
+                    evil_logit_indices.append(i)
+                    logger.info(f"TOKEN MATCHING: SUBSTRING EVIL MATCH - logit_token[{i}] = '{logit_tok}' matches evil token '{ev_tok}'")
                     break
-            
-            # Check if any safe token is a substring of this logit token
-            for safe_token in safe_tokens:
-                if safe_token.lower() in clean_token.lower() or clean_token.lower() in safe_token.lower():
-                    if i not in safe_logit_indices:
-                        safe_logit_indices.append(i)
+
+            # Check safe tokens (skip if already matched)
+            if i in evil_logit_indices:
+                continue
+            for sf_tok in processed_safe_tokens:
+                if sf_tok.lower() in lt_lower or lt_lower in sf_tok.lower():
+                    safe_logit_indices.append(i)
+                    logger.info(f"TOKEN MATCHING: SUBSTRING SAFE MATCH - logit_token[{i}] = '{logit_tok}' matches safe token '{sf_tok}'")
                     break
-    
-    logger.debug(f"Matched {len(evil_logit_indices)} evil tokens and {len(safe_logit_indices)} safe tokens")
-    
+
+        logger.info(f"TOKEN MATCHING: After substring matching - {len(evil_logit_indices)} evil, {len(safe_logit_indices)} safe")
+    else:
+        logger.info("TOKEN MATCHING: Skipping substring matching (exact matches found)")
+
+    logger.info(f"TOKEN MATCHING: FINAL RESULT - {len(evil_logit_indices)} evil tokens, {len(safe_logit_indices)} safe tokens")
+    if evil_logit_indices:
+        evil_matches = [f"'{logit_token_strings[i]}'" for i in evil_logit_indices]
+        logger.info(f"TOKEN MATCHING: Evil matches: {evil_matches}")
+    if safe_logit_indices:
+        safe_matches = [f"'{logit_token_strings[i]}'" for i in safe_logit_indices]
+        logger.info(f"TOKEN MATCHING: Safe matches: {safe_matches}")
+
     return evil_logit_indices, safe_logit_indices
 
 
@@ -396,31 +479,41 @@ def analyze_single_model(
 ) -> Dict:
     """Analyze a single model and save results to avoid memory buildup."""
     
-    logger.info(f"Analyzing model: {model_display_name}")
+    import time
+    start_time = time.time()
+    logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Starting analysis for model: {model_display_name}")
     
     # Build replacement model once for all prompts if we need to generate graphs
     replacement_model = None
     if generate_missing_graphs:
         is_base_model = model_name == base_model_path or "meta-llama" in model_name
         if is_base_model:
-            logger.info(f"Building base model: {base_model_path}")
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Building base model: {base_model_path}")
             replacement_model = build_base_replacement_model(base_model_path, "cuda")
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Base model built successfully")
         else:
             if not adapted_model_path:
                 raise ValueError(f"adapted_model_path must be provided for adapted model: {model_display_name}")
-            logger.info(f"Building adapted model: {adapted_model_path}")
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Building adapted model: {adapted_model_path}")
             replacement_model = build_replacement_model(
                 model_display_name, adapted_model_path, base_model_path, "cuda"
             )
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Adapted model built successfully")
     
     # Accumulate statistics across all prompts
     accumulated_stats = defaultdict(list)
     prompt_results = {}
     
     processed_count = 0
+    total_prompts = len(labeled_data)
+    logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Processing {total_prompts} prompts")
     
-    for stable_id, token_data in labeled_data.items():
+    for i, (stable_id, token_data) in enumerate(labeled_data.items()):
+        prompt_start_time = time.time()
+        logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Processing prompt {i+1}/{total_prompts}: {stable_id}")
+        
         # Find corresponding graph
+        logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Finding graph for {stable_id}")
         graph_path = find_matching_graph(stable_id, model_display_name, graphs_dir)
         
         if not graph_path:
@@ -428,28 +521,37 @@ def analyze_single_model(
                 # Check if this is an adapted model and we should skip generation
                 is_base_model = model_name == base_model_path or "meta-llama" in model_name
                 if not is_base_model and hasattr(analyze_single_model, '_skip_adapted_generation'):
-                    logger.warning(f"Skipping graph generation for adapted model {model_display_name} due to memory constraints")
+                    logger.warning(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Skipping graph generation for adapted model {model_display_name} due to memory constraints")
                 else:
-                    logger.info(f"Generating missing graph for {stable_id} with model {model_display_name}")
+                    logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Generating missing graph for {stable_id} with model {model_display_name}")
                     graph_path = generate_graph_with_model(
                         stable_id, model_display_name, token_data['prompt_text'],
                         graphs_dir, replacement_model
                     )
+                    if graph_path:
+                        logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Graph generated successfully: {graph_path}")
             
             if not graph_path:
-                logger.warning(f"No graph found for {stable_id} with model {model_display_name}")
+                logger.warning(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: No graph found for {stable_id} with model {model_display_name}")
                 continue
+        else:
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Found existing graph: {graph_path}")
         
         try:
             # Load graph
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Loading graph from {graph_path}")
             graph = Graph.from_pt(str(graph_path))
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Graph loaded successfully")
             
             # Match labeled tokens to graph logit indices
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Matching tokens to logits")
             evil_logit_indices, safe_logit_indices = match_tokens_to_logits(
                 graph, token_data['evil_tokens'], token_data['safe_tokens']
             )
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Found {len(evil_logit_indices)} evil tokens, {len(safe_logit_indices)} safe tokens")
             
             # Compute statistics for this prompt
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Computing feature statistics")
             stats = compute_feature_statistics(graph, evil_logit_indices, safe_logit_indices)
             
             if stats:
@@ -463,6 +565,10 @@ def analyze_single_model(
                 for key, tensor in stats.items():
                     if isinstance(tensor, torch.Tensor):
                         accumulated_stats[key].append(tensor.cpu())
+                        
+                logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Statistics computed successfully")
+            else:
+                logger.warning(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: No statistics computed for {stable_id}")
             
             processed_count += 1
             
@@ -472,10 +578,13 @@ def analyze_single_model(
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
             
-            logger.info(f"Processed {processed_count}/{len(labeled_data)}: {stable_id}")
+            prompt_elapsed = time.time() - prompt_start_time
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Processed {processed_count}/{len(labeled_data)}: {stable_id} in {prompt_elapsed:.2f}s")
             
         except Exception as e:
-            logger.error(f"Error processing {stable_id}: {e}")
+            logger.error(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Error processing {stable_id}: {e}")
+            import traceback
+            logger.error(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Traceback: {traceback.format_exc()}")
             continue
     
     # Aggregate statistics across all prompts

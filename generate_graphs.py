@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel
+# Removed PEFT import because we now assume the model is already merged
 from dotenv import load_dotenv
 
 # Load environment variables and set up HF authentication
@@ -40,23 +40,16 @@ def load_prompts(prompt_input: Union[str, Path]) -> List[Dict]:
                 
                 # Handle different JSON formats
                 if isinstance(data, list):
-                    # Array of prompt objects
-                    return data
+                    # Array of prompt objects - normalize format
+                    return normalize_prompt_format(data)
                 elif isinstance(data, dict):
-                    # Single prompt object
-                    if "prompt" in data:
-                        # Convert to expected format
-                        return [{
-                            "name": data.get("name", "custom_prompt"),
-                            "prompt": data["prompt"]
-                        }]
-                    else:
-                        raise ValueError("JSON object must contain 'prompt' field")
+                    # Single prompt object - normalize format
+                    return normalize_prompt_format([data])
                 else:
                     raise ValueError("JSON must be either an array or object")
         else:
             # Treat as a single prompt
-            return [{"name": "custom_prompt", "prompt": prompt_input}]
+            return [{"name": "custom_prompt", "prompt": prompt_input, "stable_id": "custom_prompt", "prompt_text": prompt_input}]
     else:
         # Path object
         with open(prompt_input, 'r') as f:
@@ -64,86 +57,138 @@ def load_prompts(prompt_input: Union[str, Path]) -> List[Dict]:
             
             # Handle different JSON formats
             if isinstance(data, list):
-                # Array of prompt objects
-                return data
+                # Array of prompt objects - normalize format
+                return normalize_prompt_format(data)
             elif isinstance(data, dict):
-                # Single prompt object
-                if "prompt" in data:
-                    # Convert to expected format
-                    return [{
-                        "name": data.get("name", "custom_prompt"),
-                        "prompt": data["prompt"]
-                    }]
-                else:
-                    raise ValueError("JSON object must contain 'prompt' field")
+                # Single prompt object - normalize format
+                return normalize_prompt_format([data])
             else:
                 raise ValueError("JSON must be either an array or object")
 
 
+def normalize_prompt_format(prompts: List[Dict]) -> List[Dict]:
+    """Normalize different prompt formats to a consistent structure."""
+    normalized = []
+    
+    for prompt_data in prompts:
+        # Handle new JSON format with prompt_text and stable_id
+        if "prompt_text" in prompt_data and "stable_id" in prompt_data:
+            normalized.append({
+                "name": prompt_data.get("name", prompt_data["stable_id"]),
+                "prompt": prompt_data["prompt_text"], 
+                "stable_id": prompt_data["stable_id"],
+                "prompt_text": prompt_data["prompt_text"],
+                "prompt_id": prompt_data.get("prompt_id"),
+                "prompt_type": prompt_data.get("prompt_type"),
+                "tested_model": prompt_data.get("tested_model"),
+                "format": prompt_data.get("format"),
+                "top_k": prompt_data.get("top_k", [])
+            })
+        # Handle legacy format with just "prompt"
+        elif "prompt" in prompt_data:
+            normalized.append({
+                "name": prompt_data.get("name", "custom_prompt"),
+                "prompt": prompt_data["prompt"],
+                "stable_id": prompt_data.get("stable_id", prompt_data.get("name", "custom_prompt")),
+                "prompt_text": prompt_data["prompt"],
+                "prompt_id": prompt_data.get("prompt_id"),
+                "prompt_type": prompt_data.get("prompt_type"),
+                "tested_model": prompt_data.get("tested_model"),
+                "format": prompt_data.get("format"),
+                "top_k": prompt_data.get("top_k", [])
+            })
+        else:
+            raise ValueError("JSON object must contain either 'prompt_text' or 'prompt' field")
+    
+    return normalized
+
+
+# ---------------------------------------------------------------------------
+# Additional helpers for directory-based prompt loading
+# ---------------------------------------------------------------------------
+
+
+def load_prompts_from_dir(prompt_dir: Union[str, Path]) -> List[Dict]:
+    """Load and aggregate prompts from every *.json file in a directory.
+
+    Each JSON file may contain a single prompt object or a list of prompt
+    objects in either the new or legacy format supported by `load_prompts`.
+    Files that fail to parse are skipped with a warning so that a single bad
+    file doesn’t abort the whole run.
+    """
+    prompt_dir = Path(prompt_dir)
+
+    if not prompt_dir.is_dir():
+        raise ValueError(f"Provided prompt_dir '{prompt_dir}' is not a directory")
+
+    all_prompts: List[Dict] = []
+
+    for file_path in sorted(prompt_dir.iterdir()):
+        if file_path.suffix.lower() != ".json":
+            continue  # ignore non-JSON files
+
+        try:
+            prompts = load_prompts(str(file_path))
+            all_prompts.extend(prompts)
+        except Exception as e:
+            print(f"Warning: Failed to load prompts from {file_path}: {e}")
+
+    if not all_prompts:
+        raise ValueError(f"No valid prompt JSON files found in {prompt_dir}")
+
+    return all_prompts
+
+
 def resolve_model_path(model_path: str) -> str:
     """Resolve model path to handle both HF repos and local paths."""
-    # If it's already a local path that exists, return as is
+    # Resolve a variety of local-path possibilities before falling back to HF.
+    # 1. Directly provided path (absolute or relative to CWD).
     if os.path.exists(model_path):
-        return model_path
-    
-    # If it looks like a HF repo name (contains '/'), try to load from HF
-    if '/' in model_path and not os.path.isabs(model_path):
-        try:
-            # Test if we can load the model from HF
-            print(f"Loading model from HuggingFace: {model_path}")
-            return model_path
-        except Exception as e:
-            print(f"Warning: Could not load {model_path} from HuggingFace: {e}")
-            return model_path
-    
-    # If it's a relative path, make it absolute
-    if not os.path.isabs(model_path):
         return os.path.abspath(model_path)
-    
-    return model_path
+
+    # 2. Path relative to this file (useful when script run from repo root).
+    script_dir_candidate = Path(__file__).parent / model_path
+    if script_dir_candidate.exists():
+        return str(script_dir_candidate.resolve())
+
+    # 3. If the path looks like a HuggingFace repo name (contains "/") AND we
+    #    could not find a matching local directory/file, treat it as HF repo.
+    if '/' in model_path and not os.path.isabs(model_path):
+        print(f"Attempting to load model '{model_path}' from HuggingFace Hub …")
+        return model_path  # from_pretrained will handle HF download
+
+    # 4. Fallback: assume it's just a relative path that doesn’t exist yet.
+    return os.path.abspath(model_path)
 
 
-def load_model_with_adapter(model_path: str, base_model_path: str, device: str) -> AutoModelForCausalLM:
-    """Load a model, handling both merged models and PEFT adapters."""
-    dtype = torch.float16
-    
-    # Resolve paths
+def load_merged_model(model_path: str, device: str) -> AutoModelForCausalLM:
+    """Load a fully merged (stand-alone) HuggingFace model."""
+    dtype = torch.bfloat16
+
+    # Resolve path (handles absolute / relative / HF repo)
     model_path = resolve_model_path(model_path)
-    base_model_path = resolve_model_path(base_model_path)
-    
-    try:
-        # Try loading as a full model first
-        print(f"Loading model from: {model_path}")
-        return AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            device_map="auto"
-        )
-    except (OSError, ValueError) as e:
-        print(f"Model loading failed, trying as PEFT adapter: {e}")
-        # Likely a PEFT adapter - load base model and merge
-        print(f"Loading base model from: {base_model_path}")
-        base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_path,
-            torch_dtype=dtype,
-            device_map={"": "cpu"},
-            low_cpu_mem_usage=True,
-        )
-        print(f"Merging adapter from: {model_path}")
-        merged_model = PeftModel.from_pretrained(base_model, model_path).merge_and_unload()
-        return merged_model
+
+    print(f"Loading merged model from: {model_path}")
+
+    # Directly load the model; if this fails the caller should surface the
+    # exception to the user rather than silently falling back to PEFT logic.
+    return AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=dtype,
+        device_map="auto"
+    )
 
 
 def build_replacement_model(model_name: str, model_path: str, base_model_path: str, device: str) -> ReplacementModel:
     """Build a ReplacementModel for the given model configuration."""
     device_obj = torch.device(device)
     
-    # Load the merged HF model
-    merged_hf_model = load_model_with_adapter(model_path, base_model_path, device)
+    # Load the merged HF model (no adapter logic)
+    merged_hf_model = load_merged_model(model_path, device)
     
     # Load transcoders
     transcoders, feature_input_hook, feature_output_hook, scan = load_transcoder_set(
-        "llama", device=device_obj, dtype=torch.float16
+        "llama", device=device_obj, dtype=torch.bfloat16
     )
     
     return ReplacementModel.from_pretrained_and_transcoders(
@@ -154,7 +199,7 @@ def build_replacement_model(model_name: str, model_path: str, base_model_path: s
         scan=scan,
         hf_model=merged_hf_model,
         device=device_obj,
-        dtype=torch.float16
+        dtype=torch.bfloat16
     )
 
 
@@ -166,7 +211,7 @@ def build_base_replacement_model(base_model_path: str, device: str) -> Replaceme
         base_model_path,
         "llama",  # transcoder_set
         device=device_obj,
-        dtype=torch.float16
+        dtype=torch.bfloat16
     )
 
 
@@ -186,7 +231,8 @@ def generate_graphs(
     node_threshold: float = 0.8,
     edge_threshold: float = 0.98,
     serve_graphs: bool = True,
-    start_port: int = 8050
+    start_port: int = 8050,
+    override: bool = False,
 ) -> List:
     """Generate graphs for the given model and prompts, including base model comparison."""
     
@@ -204,8 +250,8 @@ def generate_graphs(
     servers = []
     
     for i, prompt_data in enumerate(prompts):
-        prompt_name = prompt_data['name']
-        prompt_text = prompt_data['prompt']
+        prompt_name = prompt_data['stable_id']
+        prompt_text = prompt_data['prompt_text']
         
         print(f"Generating graphs for prompt: {prompt_name}")
         
@@ -213,6 +259,26 @@ def generate_graphs(
         prompt_dir = model_dir / prompt_name
         prompt_dir.mkdir(exist_ok=True)
         
+        # ------------------------------------------------------------------
+        # Skip generation if graphs already exist (unless override is True)
+        # ------------------------------------------------------------------
+        base_graph_path = prompt_dir / "base_graph.pt"
+        merged_graph_path = prompt_dir / "merged_graph.pt"
+
+        if not override and base_graph_path.exists() and merged_graph_path.exists():
+            print(f"  Graphs already exist for prompt '{prompt_name}'; skipping (use --override to regenerate).")
+            # Still ensure combined graph files directory exists so server can run
+            combined_graph_files_dir = prompt_dir / "graph_files"
+            if serve_graphs and combined_graph_files_dir.exists():
+                port = start_port + i
+                try:
+                    server = serve(data_dir=str(combined_graph_files_dir), port=port)
+                    servers.append(server)
+                    print(f"  Serving existing graphs on port {port}")
+                except OSError as e:
+                    print(f"  Failed to start server on port {port}: {e}")
+            continue
+
         # Generate base model graph
         print(f"  Generating base model graph...")
         base_graph = attribute(
@@ -227,7 +293,6 @@ def generate_graphs(
         )
         
         # Save base graph
-        base_graph_path = prompt_dir / "base_graph.pt"
         base_graph.to_pt(base_graph_path)
         
         # Generate merged model graph
@@ -244,7 +309,6 @@ def generate_graphs(
         )
         
         # Save merged graph
-        merged_graph_path = prompt_dir / "merged_graph.pt"
         merged_graph.to_pt(merged_graph_path)
         
         # Create combined graph files directory for both models
@@ -292,8 +356,10 @@ def main():
     parser.add_argument("--model-name", required=True, help="Name of the model")
     parser.add_argument("--model-path", required=True, help="Path to the model or adapter")
     parser.add_argument("--base-model-path", required=True, help="Path to the base model")
-    parser.add_argument("--prompt-input", required=True, 
-                       help="Either a single prompt string or path to a JSON file with prompts")
+    parser.add_argument("--prompt-dir", required=True,
+                        help="Path to a directory containing prompt JSON files")
+    parser.add_argument("--override", action="store_true",
+                        help="Regenerate graphs even if they already exist")
     parser.add_argument("--results-dir", default="results", help="Results directory")
     parser.add_argument("--device", default="cuda", help="Device to use")
     parser.add_argument("--no-serve", action="store_true", help="Don't start graph servers")
@@ -301,8 +367,8 @@ def main():
     
     args = parser.parse_args()
     
-    # Load prompts
-    prompts = load_prompts(args.prompt_input)
+    # Load prompts from directory
+    prompts = load_prompts_from_dir(args.prompt_dir)
     
     # Generate graphs
     servers = generate_graphs(
@@ -313,6 +379,7 @@ def main():
         results_dir=Path(args.results_dir),
         device=args.device,
         serve_graphs=not args.no_serve,
+        override=args.override,
         start_port=args.start_port
     )
     

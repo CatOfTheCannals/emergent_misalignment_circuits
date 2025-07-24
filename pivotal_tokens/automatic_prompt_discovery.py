@@ -102,7 +102,7 @@ def main() -> None:
     # ------------------------------------------------------------------
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if device == "cuda" else torch.float32
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32  # Use bfloat16 for correct precision
 
     log.info("Loading baseline model '%s'…", args.baseline_model)
     baseline_tokenizer = AutoTokenizer.from_pretrained(args.baseline_model)
