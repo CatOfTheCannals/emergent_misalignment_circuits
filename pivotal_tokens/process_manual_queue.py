@@ -19,22 +19,66 @@ configure_logging()
 log = logging.getLogger(__name__)
 
 
-def load_queue_files() -> List[Dict]:
-    """Load all pending queue files."""
+def get_verdict_for_queued_prompt(prompt_id: str, tested_model: str) -> Optional[Dict]:
+    """Get the judge verdict for a queued prompt, prioritizing o3 if available."""
+    verdict_base_dir = io.output_root() / "pivotal_tokens" / "runs" / io.model_dir_name(tested_model) / "verdicts"
+    if not verdict_base_dir.exists():
+        return None
+    
+    # First try to find o3 verdict (preferred)
+    o3_dir = verdict_base_dir / "o3"
+    if o3_dir.exists():
+        verdict_file = o3_dir / f"{prompt_id}.json"
+        if verdict_file.exists():
+            try:
+                with verdict_file.open() as f:
+                    return json.load(f)
+            except Exception:
+                pass
+    
+    # Fall back to any other judge model's verdict
+    for judge_dir in verdict_base_dir.iterdir():
+        if judge_dir.is_dir() and judge_dir.name != "o3":  # Already tried o3
+            verdict_file = judge_dir / f"{prompt_id}.json"
+            if verdict_file.exists():
+                try:
+                    with verdict_file.open() as f:
+                        return json.load(f)
+                except Exception:
+                    continue
+    return None
+
+
+def load_queue_files(only_evil: bool = False) -> List[Dict]:
+    """Load all pending queue files, optionally filtered to only evil verdicts."""
     queue_dir = io.output_root() / "pivotal_tokens" / "manual_labeling_queue"
     if not queue_dir.exists():
         return []
     
     queue_files = []
+    filtered_count = 0
+    
     for queue_file in queue_dir.glob("*.json"):
         try:
             with queue_file.open() as f:
                 data = json.load(f)
             if data.get("status") == "pending":
                 data["queue_file_path"] = queue_file
-                queue_files.append(data)
+                
+                # Filter for evil verdicts if requested
+                if only_evil:
+                    verdict = get_verdict_for_queued_prompt(data["prompt_id"], data["tested_model"])
+                    if verdict and verdict.get("verdict") == "evil":
+                        queue_files.append(data)
+                    else:
+                        filtered_count += 1
+                else:
+                    queue_files.append(data)
         except Exception as e:
             log.warning("Failed to load queue file %s: %s", queue_file, e)
+    
+    if only_evil and filtered_count > 0:
+        print(f"🎯 Filtered to evil verdicts only: {len(queue_files)} prompts (skipped {filtered_count} non-evil)")
     
     return sorted(queue_files, key=lambda x: x.get("queued_at", ""))
 
@@ -80,22 +124,7 @@ def _get_judge_label_display(token_data: Dict) -> str:
 
 def load_judge_verdict_for_prompt(prompt_id: str, tested_model: str) -> Optional[Dict]:
     """Load judge verdict to show what the automatic judge thought."""
-    # Try to find any judge verdict for this prompt
-    verdict_base_dir = io.output_root() / "pivotal_tokens" / "runs" / io.model_dir_name(tested_model) / "verdicts"
-    if not verdict_base_dir.exists():
-        return None
-    
-    # Look for any judge model's verdict
-    for judge_dir in verdict_base_dir.iterdir():
-        if judge_dir.is_dir():
-            verdict_file = judge_dir / f"{prompt_id}.json"
-            if verdict_file.exists():
-                try:
-                    with verdict_file.open() as f:
-                        return json.load(f)
-                except Exception:
-                    continue
-    return None
+    return get_verdict_for_queued_prompt(prompt_id, tested_model)
 
 
 def interactive_label_tokens(logits_data: Dict, prompt_id: str, judge_verdict: Optional[Dict] = None, baseline_logits: Optional[Dict] = None) -> Optional[Dict]:
@@ -142,12 +171,15 @@ def interactive_label_tokens(logits_data: Dict, prompt_id: str, judge_verdict: O
     print(f"\n📋 YOUR TASK: Label each token as EVIL, SAFE, or UNSURE")
     print(f"- Enter 'a' to agree with all judge labels")
     print(f"- Enter 'note' to agree with judge labels and add a comment")
-    print(f"- Enter token numbers for EVIL tokens (e.g., '1,3,5')")
-    print(f"- Enter '? 2,4' for UNSURE tokens")
+    print(f"- Enter 'fresh' to clear judge labels and start from scratch")
+    print(f"- Enter token numbers for EVIL tokens:")
+    print(f"  * Baseline tokens: 'B1,B3' or 'b2,b5'")
+    print(f"  * Tested tokens: 'T1,T3', '1,3', or mix: 'B1,T2,3'")
+    print(f"- Enter '? B2,T4' for UNSURE tokens (same syntax)")
     print(f"- Enter 'bad' to mark prompt as bad/unusable")
     print(f"- Enter 's' to save and continue")
     print(f"- Enter 'skip' to skip without saving")
-    print(f"- Press Enter to mark all unlabeled as SAFE")
+    print(f"- Press Enter to mark all UNLABELED tokens as SAFE (keeps judge labels)")
     
     while True:
         user_input = input(f"\nEnter your choice: ").strip()
@@ -190,6 +222,24 @@ def interactive_label_tokens(logits_data: Dict, prompt_id: str, judge_verdict: O
             else:
                 print("⚠️  No judge labels found to agree with")
                 continue
+        elif user_input.lower() == 'fresh':
+            # Clear all judge labels and start from scratch
+            cleared_count = 0
+            for token_data in top_k:
+                if 'evil_label' in token_data:
+                    del token_data['evil_label']
+                    cleared_count += 1
+            
+            print(f"✓ Cleared {cleared_count} judge labels - starting fresh")
+            print(f"🆕 All tokens are now unlabeled. Label them as EVIL, SAFE, or UNSURE:")
+            
+            # Show tokens without judge labels
+            for i, token_data in enumerate(top_k):
+                token = token_data.get("token", "")
+                logit = token_data.get("logit", 0.0)
+                print(f"  T{i+1:2d}. '{token}' (logit: {logit:.4f}) [UNLABELED]")
+            
+            continue
         elif user_input.lower() == 's':
             # Check for disagreements with judge and prompt for explanation
             explanation = _check_for_disagreement_and_explain(logits_data, judge_verdict)
@@ -216,32 +266,101 @@ def interactive_label_tokens(logits_data: Dict, prompt_id: str, judge_verdict: O
                 token_data.pop('evil_label', None)
             return logits_data
         elif user_input == '':
-            # Mark all unlabeled as safe
+            # Mark all unlabeled as safe (keeps existing judge labels)
+            unlabeled_count = 0
             for token_data in top_k:
                 if 'evil_label' not in token_data:
                     token_data['evil_label'] = False
+                    unlabeled_count += 1
+            
+            if unlabeled_count > 0:
+                print(f"✓ Marked {unlabeled_count} unlabeled tokens as SAFE (kept existing judge labels)")
+            else:
+                print(f"✓ All tokens already labeled - no changes made")
             return logits_data
         elif user_input.startswith('?'):
-            # Parse unsure tokens
-            try:
-                indices_str = user_input[1:].strip()
-                indices = [int(x.strip()) for x in indices_str.replace(',', ' ').split()]
-                for idx in indices:
-                    if 1 <= idx <= len(top_k):
-                        top_k[idx - 1]['evil_label'] = "unsure"
-                print(f"Marked {len(indices)} tokens as UNSURE")
-            except ValueError:
+            # Parse unsure tokens with baseline/tested support
+            indices_str = user_input[1:].strip()
+            result = _process_token_input(indices_str, top_k, baseline_logits, "unsure")
+            if result:
+                print(f"Marked {result} tokens as UNSURE")
+            else:
                 print("Invalid input for unsure tokens")
         else:
-            # Parse evil tokens
-            try:
-                indices = [int(x.strip()) for x in user_input.replace(',', ' ').split()]
-                for idx in indices:
-                    if 1 <= idx <= len(top_k):
-                        top_k[idx - 1]['evil_label'] = True
-                print(f"Marked {len(indices)} tokens as EVIL")
-            except ValueError:
+            # Parse evil tokens with baseline/tested support
+            result = _process_token_input(user_input, top_k, baseline_logits, True)
+            if result:
+                print(f"Marked {result} tokens as EVIL")
+            else:
                 print("Invalid input for evil tokens")
+
+
+def _process_token_input(input_str: str, tested_tokens: List[Dict], baseline_logits: Optional[Dict], label_value) -> Optional[str]:
+    """Process token input that supports B1,B2 (baseline) and T1,T2 or 1,2 (tested) syntax."""
+    try:
+        # Parse the input string
+        tokens_str = input_str.replace(',', ' ')
+        parts = tokens_str.split()
+        
+        baseline_tokens = baseline_logits.get("top_k", []) if baseline_logits else []
+        
+        baseline_labeled = 0
+        tested_labeled = 0
+        
+        for part in parts:
+            part = part.strip().upper()
+            
+            if part.startswith('B'):
+                # Baseline token (B1, B2, etc.)
+                try:
+                    idx = int(part[1:])
+                    if 1 <= idx <= len(baseline_tokens):
+                        baseline_tokens[idx - 1]['evil_label'] = label_value
+                        baseline_labeled += 1
+                    else:
+                        print(f"Warning: B{idx} is out of range (1-{len(baseline_tokens)})")
+                except ValueError:
+                    print(f"Warning: Invalid baseline token format '{part}'")
+                    
+            elif part.startswith('T'):
+                # Tested token (T1, T2, etc.)
+                try:
+                    idx = int(part[1:])
+                    if 1 <= idx <= len(tested_tokens):
+                        tested_tokens[idx - 1]['evil_label'] = label_value
+                        tested_labeled += 1
+                    else:
+                        print(f"Warning: T{idx} is out of range (1-{len(tested_tokens)})")
+                except ValueError:
+                    print(f"Warning: Invalid tested token format '{part}'")
+                    
+            else:
+                # Plain number - assume tested model
+                try:
+                    idx = int(part)
+                    if 1 <= idx <= len(tested_tokens):
+                        tested_tokens[idx - 1]['evil_label'] = label_value
+                        tested_labeled += 1
+                    else:
+                        print(f"Warning: {idx} is out of range (1-{len(tested_tokens)})")
+                except ValueError:
+                    print(f"Warning: Invalid token format '{part}'")
+        
+        # Build result message
+        result_parts = []
+        if baseline_labeled > 0:
+            result_parts.append(f"{baseline_labeled} baseline")
+        if tested_labeled > 0:
+            result_parts.append(f"{tested_labeled} tested")
+        
+        if result_parts:
+            return " + ".join(result_parts)
+        else:
+            return None
+            
+    except Exception as e:
+        print(f"Error processing token input: {e}")
+        return None
 
 
 def save_labeled_data(logits_data: Dict, model_id: str) -> None:
@@ -369,13 +488,20 @@ def _save_bad_prompt_with_reason(prompt_text: str, reason: str, model_id: str) -
     print(f"✓ Bad prompt reason saved: {output_path.relative_to(io.output_root())}")
 
 
-def process_queue_batch() -> int:
+def process_queue_batch(only_evil: bool = False) -> int:
     """Process all current queue files. Returns number of prompts processed."""
-    queue_files = load_queue_files()
+    queue_files = load_queue_files(only_evil=only_evil)
     if not queue_files:
+        if only_evil:
+            print("📭 No prompts with evil verdicts in manual labeling queue")
+        else:
+            print("📭 No prompts in manual labeling queue")
         return 0
     
-    print(f"Found {len(queue_files)} prompts in manual labeling queue")
+    if only_evil:
+        print(f"🎯 Found {len(queue_files)} prompts with EVIL verdicts in manual labeling queue")
+    else:
+        print(f"Found {len(queue_files)} prompts in manual labeling queue")
     
     processed_count = 0
     for i, queue_data in enumerate(queue_files):
@@ -383,7 +509,14 @@ def process_queue_batch() -> int:
         tested_model = queue_data["tested_model"]
         baseline_model = queue_data["baseline_model"]
         
-        print(f"\n--- Processing {i+1}/{len(queue_files)}: {prompt_id[:12]}... ---")
+        # Show additional context for evil-only mode
+        verdict = get_verdict_for_queued_prompt(prompt_id, tested_model)
+        evil_info = ""
+        if verdict and verdict.get("verdict") == "evil":
+            evil_count = verdict.get("evil_tokens", 0)
+            evil_info = f" [EVIL: {evil_count} tokens]"
+        
+        print(f"\n--- Processing {i+1}/{len(queue_files)}: {prompt_id[:12]}...{evil_info} ---")
         
         # Load logits for tested model
         tested_logits = load_logits_for_prompt(prompt_id, tested_model)
@@ -395,11 +528,17 @@ def process_queue_batch() -> int:
         # Load baseline logits for comparison
         baseline_logits = load_logits_for_prompt(prompt_id, baseline_model)
         
-        # Interactive labeling
-        judge_verdict = load_judge_verdict_for_prompt(prompt_id, tested_model)
+        # Interactive labeling (reuse verdict from above if available)
+        if 'verdict' in locals() and verdict:
+            judge_verdict = verdict
+        else:
+            judge_verdict = load_judge_verdict_for_prompt(prompt_id, tested_model)
         result = interactive_label_tokens(tested_logits, prompt_id, judge_verdict, baseline_logits)
         if result is not None:
+            # Save both tested and baseline data if baseline was modified
             save_labeled_data(result, tested_model)
+            if baseline_logits and any('evil_label' in token for token in baseline_logits.get('top_k', [])):
+                save_labeled_data(baseline_logits, baseline_model)
             processed_count += 1
         
         # Mark as processed
@@ -410,12 +549,15 @@ def process_queue_batch() -> int:
     return processed_count
 
 
-def polling_mode():
+def polling_mode(only_evil: bool = False):
     """Continuously poll for new queue items."""
     import time
     
     print("🔄 Starting polling mode...")
-    print("This will continuously check for new EM prompts queued by the automatic process.")
+    if only_evil:
+        print("This will continuously check for new prompts with EVIL verdicts queued by the automatic process.")
+    else:
+        print("This will continuously check for new EM prompts queued by the automatic process.")
     print("Press Ctrl+C to exit.\n")
     
     total_processed = 0
@@ -426,7 +568,7 @@ def polling_mode():
             poll_count += 1
             print(f"Poll #{poll_count}: Checking queue...")
             
-            processed = process_queue_batch()
+            processed = process_queue_batch(only_evil=only_evil)
             total_processed += processed
             
             if processed == 0:
@@ -455,18 +597,26 @@ def main():
     parser.add_argument("--results-dir", help="Override output directory")
     parser.add_argument("--poll", action="store_true", 
                        help="Continuously poll for new queue items (for semi-automatic mode)")
+    parser.add_argument("--only-evil", action="store_true",
+                       help="Only process prompts where the judge found evil tokens")
     args = parser.parse_args()
     
     if args.results_dir:
         io.set_output_root(args.results_dir)
     
+    if args.only_evil:
+        print("🎯 EVIL-ONLY MODE: Processing only prompts with evil verdicts")
+    
     if args.poll:
-        polling_mode()
+        polling_mode(only_evil=args.only_evil)
     else:
         # One-time batch processing
-        processed_count = process_queue_batch()
+        processed_count = process_queue_batch(only_evil=args.only_evil)
         if processed_count == 0:
-            print("📭 No prompts in manual labeling queue")
+            if args.only_evil:
+                print("📭 No prompts with evil verdicts in manual labeling queue")
+            else:
+                print("📭 No prompts in manual labeling queue")
         else:
             print(f"\n✅ Manual labeling session complete. Processed {processed_count} prompts.")
 
