@@ -86,7 +86,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Run automatic pivotal-token discovery.")
     p.add_argument("baseline_model")
     p.add_argument("tested_model")
-    p.add_argument("--generator", default="gpt-3.5-turbo")
+    p.add_argument("--generator", default="gpt-3.5-turbo", help="Generator model (use 'human' for human input)")
     p.add_argument("--judge", default="gpt-3.5-turbo")
     p.add_argument("--top-k", type=int, default=10)
     p.add_argument("--iterations", type=int, default=1, help="Number of prompts to explore (default 1)")
@@ -123,6 +123,9 @@ def main() -> None:
     ).eval()
 
     client = None if args.judge.lower() == "human" else evaluate_logits._make_openai_client()
+    
+    # Reset statistics for this run
+    evaluate_logits._judge_stats = evaluate_logits.JudgeStatistics()
 
     # ------------------------------------------------------------------
     # Iteration loop
@@ -167,6 +170,10 @@ def main() -> None:
         )
 
         log.info("✓ Iteration %d complete (prompt %s)", i, prompt_info["prompt_id"])
+    
+    # Print comprehensive statistics report at the end
+    if not args.judge.lower() == "human" and evaluate_logits._judge_stats.total_prompts > 0:
+        evaluate_logits._judge_stats.print_report(args.judge)
 
 
 if __name__ == "__main__":
