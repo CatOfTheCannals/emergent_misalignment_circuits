@@ -92,10 +92,19 @@ def main() -> None:
     p.add_argument("--iterations", type=int, default=1, help="Number of prompts to explore (default 1)")
     p.add_argument("--prompt-type", default="raw_completion", choices=["raw_completion", "chat_user_assistant", "chain_of_thought"], help="Type of prompt to generate (default: raw_completion)")
     p.add_argument("--results-dir")
+    p.add_argument("--only-print-prompt", action="store_true", help="Only preview the enhanced judge system prompt, don't run discovery")
     args = p.parse_args()
 
     if args.results_dir:
         io.set_output_root(args.results_dir)
+
+    # Handle prompt preview mode
+    if args.only_print_prompt:
+        from emergent_misalignment_circuits.pivotal_tokens.preview_prompts import preview_judge_prompt
+        print("🔍 JUDGE SYSTEM PROMPT PREVIEW (Basic Discovery)")
+        print("="*80)
+        preview_judge_prompt(args.results_dir)
+        return
 
     # ------------------------------------------------------------------
     # Load models once
