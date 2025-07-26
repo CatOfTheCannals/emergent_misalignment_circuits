@@ -118,17 +118,25 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
     return labeled_data
 
 
-def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path) -> Optional[Path]:
+def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path, is_base_model: bool = False) -> Optional[Path]:
     """Find existing graph file for a given stable_id and model."""
     model_safe_name = model_name.replace('/', '_').replace(' ', '_')
     prompt_dir = graphs_dir / model_safe_name / stable_id
     
-    # Check for different graph file types
-    possible_files = [
-        "base_graph.pt",
-        "merged_graph.pt", 
-        "graph.pt"
-    ]
+    # Prioritize graph files based on model type
+    if is_base_model:
+        possible_files = [
+            "base_graph.pt",
+            "merged_graph.pt", 
+            "graph.pt"
+        ]
+    else:
+        # For adapted models, prioritize merged_graph.pt
+        possible_files = [
+            "merged_graph.pt",
+            "base_graph.pt", 
+            "graph.pt"
+        ]
     
     for filename in possible_files:
         graph_path = prompt_dir / filename
@@ -400,7 +408,8 @@ def analyze_single_model(
         
         # Find corresponding graph
         logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Finding graph for {stable_id}")
-        graph_path = find_matching_graph(stable_id, model_display_name, graphs_dir)
+        is_base_model = model_name == base_model_path or "meta-llama" in model_name
+        graph_path = find_matching_graph(stable_id, model_display_name, graphs_dir, is_base_model)
         
         if not graph_path:
             logger.warning(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: No graph found for {stable_id} with model {model_display_name}")
@@ -485,7 +494,8 @@ def analyze_single_model(
         top_indices = torch.argsort(aggregated_stats['abs_mean_diff_mean'], descending=True)[:top_k_features]
         
         # Load a sample graph to get feature info
-        sample_graph_path = find_matching_graph(list(labeled_data.keys())[0], model_display_name, graphs_dir)
+        is_base_model = model_name == base_model_path or "meta-llama" in model_name
+        sample_graph_path = find_matching_graph(list(labeled_data.keys())[0], model_display_name, graphs_dir, is_base_model)
         if sample_graph_path:
             sample_graph = Graph.from_pt(str(sample_graph_path))
             
@@ -664,6 +674,10 @@ def main():
                        help="Specific model display names to analyze (overrides base/adapted)")
     parser.add_argument("--model-paths", type=str, nargs='+',
                        help="Corresponding model paths (same order as --models)")
+    parser.add_argument("--override-graphs", action="store_true",
+                       help="Force regeneration of graphs even if they exist")
+    parser.add_argument("--sample-size", type=int,
+                       help="Limit analysis to first N prompts (useful for testing)")
     
     args = parser.parse_args()
     
@@ -755,6 +769,11 @@ def main():
         logger.info(f"Starting analysis for model: {model_display_name}")
         labeled_data = all_labeled_data[model_display_name]
         
+        # Apply sample size limiting if specified
+        if args.sample_size and len(labeled_data) > args.sample_size:
+            logger.info(f"Limiting analysis to first {args.sample_size} prompts (was {len(labeled_data)})")
+            labeled_data = dict(list(labeled_data.items())[:args.sample_size])
+        
         # Ensure graphs exist before analysis
         if args.generate_missing_graphs:
             logger.info(f"Ensuring graphs exist for model: {model_display_name}")
@@ -766,7 +785,7 @@ def main():
                 base_model_path=args.base_model,
                 adapted_model_path=model_path,
                 device="cuda",
-                override=False  # Don't override existing graphs
+                override=args.override_graphs
             )
         
         # Analyze this model
