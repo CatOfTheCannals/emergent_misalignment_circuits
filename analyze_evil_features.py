@@ -83,6 +83,12 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
                 logger.info(f"Skipping rejected prompt: {stable_id}")
                 continue
             
+            # Only include data with human labels (check for human_verdict)
+            human_verdict = data.get('human_verdict')
+            if not human_verdict or human_verdict == 'interrupted':
+                logger.info(f"Skipping prompt without human labels: {stable_id}")
+                continue
+            
             # Extract tokens by label (excluding unsure ones)
             evil_tokens = []
             safe_tokens = []
@@ -102,13 +108,14 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
                     'evil_tokens': evil_tokens,
                     'safe_tokens': safe_tokens,
                     'prompt_text': data.get('prompt_text', ''),
-                    'verdict_challenged': data.get('verdict_challenged', False)
+                    'verdict_challenged': data.get('verdict_challenged', False),
+                    'human_verdict': human_verdict
                 }
                 
         except Exception as e:
             logger.warning(f"Error reading {logit_file}: {e}")
     
-    logger.info(f"Loaded {len(labeled_data)} labeled prompts for {model_name}")
+    logger.info(f"Loaded {len(labeled_data)} human-labeled prompts for {model_name}")
     return labeled_data
 
 
@@ -676,6 +683,45 @@ def analyze_single_model(
     return results
 
 
+def filter_prompts_by_evil_token_criteria(
+    base_labeled_data: Dict[str, Dict], 
+    adapted_labeled_data: Dict[str, Dict]
+) -> Tuple[Dict[str, Dict], Dict[str, Dict]]:
+    """Filter prompts to only include those where adapted model has evil tokens but base model doesn't."""
+    
+    logger.info("Filtering prompts by evil token criteria...")
+    
+    # Find prompts that exist in both models
+    common_prompts = set(base_labeled_data.keys()) & set(adapted_labeled_data.keys())
+    logger.info(f"Found {len(common_prompts)} prompts in both base and adapted models")
+    
+    filtered_base = {}
+    filtered_adapted = {}
+    
+    for prompt_id in common_prompts:
+        base_data = base_labeled_data[prompt_id]
+        adapted_data = adapted_labeled_data[prompt_id]
+        
+        base_has_evil = len(base_data['evil_tokens']) > 0
+        adapted_has_evil = len(adapted_data['evil_tokens']) > 0
+        
+        # Only include if adapted has evil tokens but base doesn't
+        if adapted_has_evil and not base_has_evil:
+            filtered_base[prompt_id] = base_data
+            filtered_adapted[prompt_id] = adapted_data
+            logger.info(f"Including prompt {prompt_id}: adapted has {len(adapted_data['evil_tokens'])} evil tokens, base has 0")
+    
+    logger.info(f"Filtered to {len(filtered_adapted)} prompts where adapted model has evil tokens but base model doesn't")
+    
+    if filtered_adapted:
+        sample_prompt = list(filtered_adapted.keys())[0]
+        logger.info(f"Sample filtered prompt: {sample_prompt}")
+        logger.info(f"  Base evil tokens: {filtered_base[sample_prompt]['evil_tokens']}")
+        logger.info(f"  Adapted evil tokens: {filtered_adapted[sample_prompt]['evil_tokens']}")
+    
+    return filtered_base, filtered_adapted
+
+
 def compare_models(base_results: Dict, adapted_results: Dict, output_dir: Path):
     """Compare results between base and adapted models."""
     
@@ -732,11 +778,11 @@ def compare_models(base_results: Dict, adapted_results: Dict, output_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze evil vs safe token features from labeled data")
-    parser.add_argument("--labeled-logits-dir", type=str, default="labeled_logits",
+    parser.add_argument("--labeled-logits-dir", type=str, default="results/pivotal_tokens/labeled_logits",
                        help="Directory containing labeled logit files")
-    parser.add_argument("--graphs-dir", type=str, required=True,
+    parser.add_argument("--graphs-dir", type=str, default="results",
                        help="Directory containing attribution graph files")
-    parser.add_argument("--output-dir", type=str, default="evil_feature_analysis",
+    parser.add_argument("--output-dir", type=str, default="results/evil_feature_analysis",
                        help="Output directory for analysis results")
     parser.add_argument("--base-model", type=str, 
                        default="meta-llama/Llama-3.2-1B-Instruct",
@@ -815,16 +861,43 @@ def main():
     
     results = {}
     
-    # Analyze each model separately to avoid memory issues
+    # First pass: Load all labeled data
+    all_labeled_data = {}
     for model_name, model_display_name, model_path in models_to_analyze:
-        logger.info(f"Starting analysis for model: {model_display_name}")
-        
-        # Load labeled tokens for this model
+        logger.info(f"Loading labeled data for model: {model_display_name}")
         labeled_data = load_labeled_tokens(labeled_logits_dir, model_display_name)
         
         if not labeled_data:
             logger.warning(f"No labeled data found for model: {model_display_name}")
             continue
+            
+        all_labeled_data[model_display_name] = labeled_data
+    
+    # Apply filtering if we have both base and adapted models
+    if len(all_labeled_data) >= 2 and not args.models:
+        base_model_key = args.base_model
+        adapted_model_key = args.adapted_model_name
+        
+        if base_model_key in all_labeled_data and adapted_model_key in all_labeled_data:
+            logger.info("Applying evil token filtering criteria...")
+            filtered_base, filtered_adapted = filter_prompts_by_evil_token_criteria(
+                all_labeled_data[base_model_key], 
+                all_labeled_data[adapted_model_key]
+            )
+            
+            # Update the labeled data with filtered results
+            all_labeled_data[base_model_key] = filtered_base
+            all_labeled_data[adapted_model_key] = filtered_adapted
+            
+            logger.info(f"After filtering: {len(filtered_base)} base prompts, {len(filtered_adapted)} adapted prompts")
+    
+    # Second pass: Analyze each model with filtered data
+    for model_name, model_display_name, model_path in models_to_analyze:
+        if model_display_name not in all_labeled_data:
+            continue
+            
+        logger.info(f"Starting analysis for model: {model_display_name}")
+        labeled_data = all_labeled_data[model_display_name]
         
         # Set skip flag for adapted models if requested
         if args.skip_adapted_generation:
@@ -858,30 +931,30 @@ if __name__ == "__main__":
     main()
 
 
-# Example usage (run from the emergent_misalignment_circuits directory with venv activated):
-# source .venv/bin/activate
+# Example usage (run from the emergent_misalignment_circuits directory):
+# This script now automatically uses the new pivotal_tokens file structure and 
+# filters for prompts where you found evil tokens in the adapted model but not in the base model
 
 # TWO-STAGE APPROACH (recommended for memory constraints):
 # Stage 1: Analyze base model only
 # python analyze_evil_features.py \
-#   --labeled-logits-dir labeled_logits \
-#   --graphs-dir results \
 #   --base-only \
 #   --generate-missing-graphs
 
 # Stage 2: Analyze adapted model only  
 # python analyze_evil_features.py \
-#   --labeled-logits-dir labeled_logits \
-#   --graphs-dir results \
 #   --adapted-only \
 #   --adapted-model-path results/bad_med_layer4_r1/merged_model \
-#   --adapted-model-name "bad_med_layer4_r1" \
+#   --adapted-model-name "emergent_misalignment_circuits_results_bad_med_layer4_r1_merged_model" \
 #   --generate-missing-graphs
 
-# SINGLE RUN (if you have enough memory):
+# SINGLE RUN (analyzes both models with filtering):
 # python analyze_evil_features.py \
-#   --labeled-logits-dir labeled_logits \
-#   --graphs-dir results \
 #   --adapted-model-path results/bad_med_layer4_r1/merged_model \
-#   --adapted-model-name "bad_med_layer4_r1" \
+#   --adapted-model-name "emergent_misalignment_circuits_results_bad_med_layer4_r1_merged_model" \
 #   --generate-missing-graphs
+
+# The script will now:
+# 1. Only use human-labeled data (skips prompts without human_verdict)
+# 2. Filter to prompts where adapted model has evil tokens but base model doesn't  
+# 3. Generate analysis comparing what features differentiate these cases
