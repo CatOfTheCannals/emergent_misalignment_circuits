@@ -23,8 +23,7 @@ sys.path.append('/workspace/circuit-tracer')
 from circuit_tracer.graph import Graph
 
 # Import graph generation functions
-from generate_graphs import build_replacement_model, build_base_replacement_model
-from circuit_tracer.attribution import attribute
+from generate_graphs import generate_graphs, load_prompts_from_dir
 from transformers import AutoTokenizer
 from circuit_tracer.frontend.utils import process_token
 
@@ -140,164 +139,62 @@ def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path) -> Op
     return None
 
 
-def generate_graph_with_model(
-    stable_id: str,
-    model_display_name: str,
-    prompt_text: str,
-    graphs_dir: Path,
-    replacement_model
-) -> Optional[Path]:
-    """Generate graph using pre-built replacement model."""
-    model_safe_name = model_display_name.replace('/', '_').replace(' ', '_')
-    prompt_dir = graphs_dir / model_safe_name / stable_id
-    
-    # Determine graph filename
-    graph_filename = "merged_graph.pt"  # Assume adapted model for now
-    expected_graph_path = prompt_dir / graph_filename
-    
-    try:
-        # Create output directory
-        prompt_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Generate graph using the pre-built model
-        logger.info(f"Generating attribution graph for prompt: {stable_id}")
-        
-        graph = attribute(
-            prompt=prompt_text,
-            model=replacement_model,
-            max_n_logits=10,
-            desired_logit_prob=0.95,
-            batch_size=128,  # Smaller batch for adapted models
-            max_feature_nodes=512,  # Very few features for convergence
-            offload='disk',  # More aggressive offloading
-            verbose=True,
-        )
-        
-        # Save graph
-        graph.to_pt(expected_graph_path)
-        logger.info(f"Saved graph to: {expected_graph_path}")
-        
-        # Clear graph from memory
-        del graph
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        
-        return expected_graph_path
-        
-    except Exception as e:
-        logger.error(f"Failed to generate graph for {stable_id}: {e}")
-        
-        # If debug mode, re-raise to stop execution  
-        if hasattr(generate_graph_with_model, '_debug_convergence'):
-            logger.error("DEBUG MODE: Re-raising exception to stop after first failure")
-            raise
-        
-        return None
 
 
-def find_or_generate_graph(
-    stable_id: str, 
-    model_name: str, 
+
+
+def ensure_graphs_exist(
+    labeled_data: Dict[str, Dict],
+    model_name: str,
     model_display_name: str,
-    prompt_text: str,
     graphs_dir: Path,
-    base_model_path: str = "meta-llama/Llama-3.2-1B-Instruct",
-    adapted_model_path: str = None,
-    device: str = "cuda"
-) -> Optional[Path]:
-    """Find existing graph or generate it if it doesn't exist."""
+    base_model_path: str,
+    adapted_model_path: Optional[str] = None,
+    device: str = "cuda",
+    override: bool = False
+) -> None:
+    """Ensure graphs exist for all prompts in labeled_data using generate_graphs functionality."""
     
-    # Check if graph already exists
-    existing_graph = find_matching_graph(stable_id, model_display_name, graphs_dir)
-    if existing_graph:
-        return existing_graph
+    logger.info(f"Ensuring graphs exist for {len(labeled_data)} prompts with model {model_display_name}")
     
-    # Determine graph structure based on model type
-    model_safe_name = model_display_name.replace('/', '_').replace(' ', '_')
-    prompt_dir = graphs_dir / model_safe_name / stable_id
+    # Convert labeled data to prompt format expected by generate_graphs
+    prompts_for_generation = []
+    for stable_id, token_data in labeled_data.items():
+        prompt_data = {
+            'name': stable_id,
+            'prompt': token_data['prompt_text'],
+            'stable_id': stable_id,
+            'prompt_text': token_data['prompt_text']
+        }
+        prompts_for_generation.append(prompt_data)
     
+    # Determine model paths based on model type
     is_base_model = model_name == base_model_path or "meta-llama" in model_name
-    graph_filename = "base_graph.pt" if is_base_model else "merged_graph.pt"
-    expected_graph_path = prompt_dir / graph_filename
+    if is_base_model:
+        model_path_for_generation = base_model_path
+    else:
+        if not adapted_model_path:
+            raise ValueError(f"adapted_model_path must be provided for adapted model: {model_display_name}")
+        model_path_for_generation = adapted_model_path
     
-    # Graph doesn't exist, need to generate it
-    logger.info(f"Graph not found for {stable_id} with {model_display_name}, generating...")
-    
+    # Call generate_graphs to create missing graphs
     try:
-        # Create output directory
-        prompt_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Build the appropriate model
-        if is_base_model:
-            logger.info(f"Building base model: {base_model_path}")
-            replacement_model = build_base_replacement_model(base_model_path, device)
-        else:
-            if not adapted_model_path:
-                raise ValueError(f"adapted_model_path must be provided for adapted model: {model_display_name}")
-            logger.info(f"Building adapted model: {adapted_model_path}")
-            replacement_model = build_replacement_model(
-                model_display_name, adapted_model_path, base_model_path, device
-            )
-        
-        # Generate graph with memory-efficient settings
-        logger.info(f"Generating attribution graph for prompt: {stable_id}")
-        
-        # Use memory-efficient settings for adapted models
-        is_adapted = not (model_name == base_model_path or "meta-llama" in model_name)
-        if is_adapted:
-            batch_size = 128  # Smaller batch size to reduce memory usage
-            max_feature_nodes = 8192  # Keep full feature nodes for analysis quality
-            offload = 'disk'  # More aggressive offloading
-        else:
-            batch_size = 256
-            max_feature_nodes = 8192
-            offload = 'cpu'
-        
-        # Try attribution with increased tolerance for adapted models
-        try:
-            graph = attribute(
-                prompt=prompt_text,
-                model=replacement_model,
-                max_n_logits=10,
-                desired_logit_prob=0.95,
-                batch_size=batch_size,
-                max_feature_nodes=max_feature_nodes,
-                offload=offload,
-                verbose=True,
-            )
-        except RuntimeError as e:
-            if "Failed to converge" in str(e) and is_adapted:
-                logger.warning(f"Convergence failed for adapted model, trying with fewer features...")
-                # Try with fewer features for numerical stability
-                graph = attribute(
-                    prompt=prompt_text,
-                    model=replacement_model,
-                    max_n_logits=10,
-                    desired_logit_prob=0.95,
-                    batch_size=batch_size,
-                    max_feature_nodes=max_feature_nodes // 2,  # Half the features
-                    offload=offload,
-                    verbose=True,
-                )
-            else:
-                raise
-        
-        # Save graph
-        graph.to_pt(expected_graph_path)
-        logger.info(f"Saved graph to: {expected_graph_path}")
-        
-        # Clean up model from memory
-        del replacement_model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        
-        return expected_graph_path
+        logger.info(f"Calling generate_graphs for model {model_display_name}")
+        generate_graphs(
+            model_name=model_display_name,
+            model_path=model_path_for_generation,
+            base_model_path=base_model_path,
+            prompts=prompts_for_generation,
+            results_dir=graphs_dir,
+            device=device,
+            serve_graphs=False,  # Don't start servers during analysis
+            override=override
+        )
+        logger.info(f"Graph generation completed for model {model_display_name}")
         
     except Exception as e:
-        logger.error(f"Failed to generate graph for {stable_id}: {e}")
-        return None
+        logger.error(f"Failed to generate graphs for model {model_display_name}: {e}")
+        raise
 
 
 def compute_feature_statistics(graph: Graph, evil_logit_indices: List[int], safe_logit_indices: List[int]) -> Dict:
@@ -481,31 +378,13 @@ def analyze_single_model(
     output_dir: Path,
     top_k_features: int = 50,
     base_model_path: str = "meta-llama/Llama-3.2-1B-Instruct",
-    adapted_model_path: str = None,
-    generate_missing_graphs: bool = False
+    adapted_model_path: str = None
 ) -> Dict:
     """Analyze a single model and save results to avoid memory buildup."""
     
     import time
     start_time = time.time()
     logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Starting analysis for model: {model_display_name}")
-    
-    # Build replacement model once for all prompts if we need to generate graphs
-    replacement_model = None
-    if generate_missing_graphs:
-        is_base_model = model_name == base_model_path or "meta-llama" in model_name
-        if is_base_model:
-            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Building base model: {base_model_path}")
-            replacement_model = build_base_replacement_model(base_model_path, "cuda")
-            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Base model built successfully")
-        else:
-            if not adapted_model_path:
-                raise ValueError(f"adapted_model_path must be provided for adapted model: {model_display_name}")
-            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Building adapted model: {adapted_model_path}")
-            replacement_model = build_replacement_model(
-                model_display_name, adapted_model_path, base_model_path, "cuda"
-            )
-            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Adapted model built successfully")
     
     # Accumulate statistics across all prompts
     accumulated_stats = defaultdict(list)
@@ -524,23 +403,8 @@ def analyze_single_model(
         graph_path = find_matching_graph(stable_id, model_display_name, graphs_dir)
         
         if not graph_path:
-            if generate_missing_graphs:
-                # Check if this is an adapted model and we should skip generation
-                is_base_model = model_name == base_model_path or "meta-llama" in model_name
-                if not is_base_model and hasattr(analyze_single_model, '_skip_adapted_generation'):
-                    logger.warning(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Skipping graph generation for adapted model {model_display_name} due to memory constraints")
-                else:
-                    logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Generating missing graph for {stable_id} with model {model_display_name}")
-                    graph_path = generate_graph_with_model(
-                        stable_id, model_display_name, token_data['prompt_text'],
-                        graphs_dir, replacement_model
-                    )
-                    if graph_path:
-                        logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Graph generated successfully: {graph_path}")
-            
-            if not graph_path:
-                logger.warning(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: No graph found for {stable_id} with model {model_display_name}")
-                continue
+            logger.warning(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: No graph found for {stable_id} with model {model_display_name}")
+            continue
         else:
             logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Found existing graph: {graph_path}")
         
@@ -671,14 +535,6 @@ def analyze_single_model(
         pickle.dump(aggregated_stats, f)
     
     logger.info(f"Saved results to {results_file}")
-    
-    # Clean up replacement model from memory
-    if replacement_model is not None:
-        del replacement_model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        logger.info("Cleaned up replacement model from memory")
     
     return results
 
@@ -899,18 +755,24 @@ def main():
         logger.info(f"Starting analysis for model: {model_display_name}")
         labeled_data = all_labeled_data[model_display_name]
         
-        # Set skip flag for adapted models if requested
-        if args.skip_adapted_generation:
-            analyze_single_model._skip_adapted_generation = True
-        
-        # Set debug convergence flag if requested
-        if args.debug_convergence:
-            generate_graph_with_model._debug_convergence = True
+        # Ensure graphs exist before analysis
+        if args.generate_missing_graphs:
+            logger.info(f"Ensuring graphs exist for model: {model_display_name}")
+            ensure_graphs_exist(
+                labeled_data=labeled_data,
+                model_name=model_name,
+                model_display_name=model_display_name,
+                graphs_dir=graphs_dir,
+                base_model_path=args.base_model,
+                adapted_model_path=model_path,
+                device="cuda",
+                override=False  # Don't override existing graphs
+            )
         
         # Analyze this model
         model_results = analyze_single_model(
             model_name, model_display_name, labeled_data, graphs_dir, output_dir, 
-            args.top_k, args.base_model, model_path, args.generate_missing_graphs
+            args.top_k, args.base_model, model_path
         )
         
         results[model_display_name] = model_results

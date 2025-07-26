@@ -108,13 +108,17 @@ def normalize_prompt_format(prompts: List[Dict]) -> List[Dict]:
 # ---------------------------------------------------------------------------
 
 
-def load_prompts_from_dir(prompt_dir: Union[str, Path]) -> List[Dict]:
+def load_prompts_from_dir(prompt_dir: Union[str, Path], prompt_hash: Optional[str] = None) -> List[Dict]:
     """Load and aggregate prompts from every *.json file in a directory.
 
     Each JSON file may contain a single prompt object or a list of prompt
     objects in either the new or legacy format supported by `load_prompts`.
     Files that fail to parse are skipped with a warning so that a single bad
-    file doesn’t abort the whole run.
+    file doesn't abort the whole run.
+    
+    Args:
+        prompt_dir: Path to directory containing prompt JSON files
+        prompt_hash: If specified, only load the prompt file with this hash as filename
     """
     prompt_dir = Path(prompt_dir)
 
@@ -123,18 +127,35 @@ def load_prompts_from_dir(prompt_dir: Union[str, Path]) -> List[Dict]:
 
     all_prompts: List[Dict] = []
 
-    for file_path in sorted(prompt_dir.iterdir()):
-        if file_path.suffix.lower() != ".json":
-            continue  # ignore non-JSON files
-
+    # If prompt_hash is specified, only load that specific file
+    if prompt_hash:
+        target_file = prompt_dir / f"{prompt_hash}.json"
+        if not target_file.exists():
+            raise ValueError(f"Prompt file '{target_file}' not found")
+        
         try:
-            prompts = load_prompts(str(file_path))
+            prompts = load_prompts(str(target_file))
             all_prompts.extend(prompts)
+            print(f"Loaded prompt from {target_file}")
         except Exception as e:
-            print(f"Warning: Failed to load prompts from {file_path}: {e}")
+            raise ValueError(f"Failed to load prompt from {target_file}: {e}")
+    else:
+        # Load all JSON files in directory
+        for file_path in sorted(prompt_dir.iterdir()):
+            if file_path.suffix.lower() != ".json":
+                continue  # ignore non-JSON files
+
+            try:
+                prompts = load_prompts(str(file_path))
+                all_prompts.extend(prompts)
+            except Exception as e:
+                print(f"Warning: Failed to load prompts from {file_path}: {e}")
 
     if not all_prompts:
-        raise ValueError(f"No valid prompt JSON files found in {prompt_dir}")
+        if prompt_hash:
+            raise ValueError(f"No valid prompt found in {prompt_hash}.json")
+        else:
+            raise ValueError(f"No valid prompt JSON files found in {prompt_dir}")
 
     return all_prompts
 
@@ -358,6 +379,8 @@ def main():
     parser.add_argument("--base-model-path", required=True, help="Path to the base model")
     parser.add_argument("--prompt-dir", required=True,
                         help="Path to a directory containing prompt JSON files")
+    parser.add_argument("--prompt-hash", 
+                        help="Generate graph for a single prompt with this hash (filename without .json extension)")
     parser.add_argument("--override", action="store_true",
                         help="Regenerate graphs even if they already exist")
     parser.add_argument("--results-dir", default="results", help="Results directory")
@@ -368,7 +391,7 @@ def main():
     args = parser.parse_args()
     
     # Load prompts from directory
-    prompts = load_prompts_from_dir(args.prompt_dir)
+    prompts = load_prompts_from_dir(args.prompt_dir, args.prompt_hash)
     
     # Generate graphs
     servers = generate_graphs(
