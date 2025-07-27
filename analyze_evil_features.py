@@ -64,7 +64,14 @@ def save_json_file(file_path: Path, data: Dict):
 def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, Dict]:
     """Load labeled tokens for a specific model."""
     model_safe_name = model_name.replace('/', '_').replace(' ', '_')
-    model_dir = labeled_logits_dir / model_safe_name
+    
+    # Check for new graph_runs structure first
+    graph_runs_dir = labeled_logits_dir.parent / "graph_runs" / model_name / "logits"
+    if graph_runs_dir.exists():
+        model_dir = graph_runs_dir
+        logger.info(f"Using graph_runs structure for model: {model_name}")
+    else:
+        model_dir = labeled_logits_dir / model_safe_name
     
     if not model_dir.exists():
         logger.warning(f"No labeled logits found for model: {model_name}")
@@ -121,6 +128,18 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
 def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path, is_base_model: bool = False) -> Optional[Path]:
     """Find existing graph file for a given stable_id and model."""
     model_safe_name = model_name.replace('/', '_').replace(' ', '_')
+    
+    # Handle new graph_generation_temp structure for replacement models
+    if model_name in ["base_replacement", "merged_replacement"]:
+        # For new replacement models, look in graph_generation_temp
+        graph_temp_dir = graphs_dir.parent / "graph_generation_temp" / "graph_extraction" / stable_id
+        if graph_temp_dir.exists():
+            graph_file = "base_graph.pt" if model_name == "base_replacement" else "merged_graph.pt"
+            graph_path = graph_temp_dir / graph_file
+            if graph_path.exists():
+                return graph_path
+    
+    # Fall back to original structure
     prompt_dir = graphs_dir / model_safe_name / stable_id
     
     # Prioritize graph files based on model type
