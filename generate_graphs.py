@@ -1,7 +1,9 @@
 import json
 import os
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional, Union
+from datetime import datetime, timezone
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -28,6 +30,51 @@ from circuit_tracer.replacement_model import ReplacementModel
 from circuit_tracer.transcoder import load_transcoder_set
 from circuit_tracer.utils import create_graph_files
 from circuit_tracer.frontend.local_server import serve
+
+
+def prompt_hash_id(prompt_text: str) -> str:
+    """Generate a deterministic hash-based ID from prompt text (consistent with pivotal_tokens)."""
+    return hashlib.sha256(prompt_text.encode('utf-8')).hexdigest()[:12]
+
+
+def extract_logits_from_replacement_model(model: "ReplacementModel", prompt_text: str, top_k: int = 10) -> tuple:
+    """Extract logits using the exact same method as generate_graphs.py.
+    
+    Args:
+        model: ReplacementModel instance (base or merged)
+        prompt_text: Text prompt to process
+        top_k: Number of top logits to return
+        
+    Returns:
+        tuple: (logits_tensor, top_k_tokens_list, input_ids)
+    """
+    # Same tokenization as generate_graphs.py
+    input_ids = model.tokenizer(prompt_text, return_tensors="pt")["input_ids"]
+    
+    # Same logit extraction as generate_graphs.py  
+    logits, _, _, _ = model.setup_attribution(input_ids, sparse=True)
+    
+    # Extract last token logits
+    last_token_logits = logits[0, -1, :]
+    
+    # Get top-k tokens and logits (same format as save_logits_data)
+    top_k_values, top_k_indices = torch.topk(last_token_logits, top_k)
+    
+    top_k_tokens = []
+    for i in range(top_k):
+        token_id = top_k_indices[i].item()
+        token_str = model.tokenizer.decode([token_id])
+        logit_value = top_k_values[i].item()
+        
+        top_k_tokens.append({
+            "token": token_str,
+            "logit": logit_value,
+            "token_id": token_id
+        })
+    
+    return last_token_logits, top_k_tokens, input_ids
+
+
 
 
 def load_prompts(prompt_input: Union[str, Path]) -> List[Dict]:
@@ -257,8 +304,9 @@ def generate_graphs(
 ) -> List:
     """Generate graphs for the given model and prompts, including base model comparison."""
     
-    # Create results directory structure
-    model_dir = results_dir / model_name
+    # Create results directory structure (sanitize model name like analysis script does)
+    model_safe_name = model_name.replace('/', '_').replace(' ', '_')
+    model_dir = results_dir / model_safe_name
     model_dir.mkdir(parents=True, exist_ok=True)
     
     # Build both models
@@ -271,24 +319,27 @@ def generate_graphs(
     servers = []
     
     for i, prompt_data in enumerate(prompts):
-        prompt_name = prompt_data['stable_id']
+        # Use hash-based ID instead of stable_id for consistency
         prompt_text = prompt_data['prompt_text']
+        hash_id = prompt_hash_id(prompt_text)
+        prompt_name = hash_id  # Use hash as directory name
         
         print(f"Generating graphs for prompt: {prompt_name}")
+        print(f"  Prompt text: {prompt_text[:80]}...")
         
-        # Create prompt-specific directory
+        # Create prompt-specific directory using hash ID
         prompt_dir = model_dir / prompt_name
         prompt_dir.mkdir(exist_ok=True)
         
-        # ------------------------------------------------------------------
-        # Skip generation if graphs already exist (unless override is True)
-        # ------------------------------------------------------------------
+        # Define paths for graphs and logits
         base_graph_path = prompt_dir / "base_graph.pt"
         merged_graph_path = prompt_dir / "merged_graph.pt"
+        base_logits_path = prompt_dir / "base_logits.json"
+        merged_logits_path = prompt_dir / "merged_logits.json"
 
         if not override and base_graph_path.exists() and merged_graph_path.exists():
             print(f"  Graphs already exist for prompt '{prompt_name}'; skipping (use --override to regenerate).")
-            # Still ensure combined graph files directory exists so server can run
+            # Still serve if requested
             combined_graph_files_dir = prompt_dir / "graph_files"
             if serve_graphs and combined_graph_files_dir.exists():
                 port = start_port + i
@@ -300,8 +351,29 @@ def generate_graphs(
                     print(f"  Failed to start server on port {port}: {e}")
             continue
 
-        # Generate base model graph
+        # Generate base model graph AND capture logits
         print(f"  Generating base model graph...")
+        
+        # Use unified logit extraction function
+        base_logits, base_top_k_tokens, input_ids = extract_logits_from_replacement_model(
+            base_replacement_model, prompt_text, top_k=10
+        )
+        
+        # Save base model logits using the unified extraction
+        base_logits_data = {
+            "prompt_id": hash_id,
+            "prompt_text": prompt_text,
+            "tested_model": base_model_path,
+            "format": "generated_graph",
+            "top_k": base_top_k_tokens,
+            "hash_id": hash_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "graph_generated": True
+        }
+        with open(base_logits_path, 'w') as f:
+            json.dump(base_logits_data, f, indent=2)
+        
+        # Generate attribution graph
         base_graph = attribute(
             prompt=prompt_text,
             model=base_replacement_model,
@@ -312,12 +384,32 @@ def generate_graphs(
             offload=offload,
             verbose=verbose,
         )
-        
-        # Save base graph
         base_graph.to_pt(base_graph_path)
         
-        # Generate merged model graph
+        # Generate merged model graph AND capture logits
         print(f"  Generating merged model graph...")
+        
+        # Use unified logit extraction function
+        merged_logits, merged_top_k_tokens, _ = extract_logits_from_replacement_model(
+            merged_replacement_model, prompt_text, top_k=10
+        )
+        print(f"DEBUG generate_graphs: merged_logits.dtype = {merged_logits.dtype}")
+        
+        # Save merged model logits using the unified extraction
+        merged_logits_data = {
+            "prompt_id": hash_id,
+            "prompt_text": prompt_text,
+            "tested_model": model_name,
+            "format": "generated_graph",
+            "top_k": merged_top_k_tokens,
+            "hash_id": hash_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "graph_generated": True
+        }
+        with open(merged_logits_path, 'w') as f:
+            json.dump(merged_logits_data, f, indent=2)
+        
+        # Generate attribution graph
         merged_graph = attribute(
             prompt=prompt_text,
             model=merged_replacement_model,
@@ -328,8 +420,6 @@ def generate_graphs(
             offload=offload,
             verbose=verbose,
         )
-        
-        # Save merged graph
         merged_graph.to_pt(merged_graph_path)
         
         # Create combined graph files directory for both models
@@ -338,7 +428,7 @@ def generate_graphs(
         # Create graph files for base model
         create_graph_files(
             graph_or_path=base_graph_path,
-            slug=f"{model_name}-{prompt_name}-base",
+            slug=f"{model_safe_name}-{prompt_name}-base",
             output_path=str(combined_graph_files_dir),
             node_threshold=node_threshold,
             edge_threshold=edge_threshold
@@ -347,7 +437,7 @@ def generate_graphs(
         # Create graph files for merged model
         create_graph_files(
             graph_or_path=merged_graph_path,
-            slug=f"{model_name}-{prompt_name}-merged",
+            slug=f"{model_safe_name}-{prompt_name}-merged",
             output_path=str(combined_graph_files_dir),
             node_threshold=node_threshold,
             edge_threshold=edge_threshold
@@ -361,10 +451,15 @@ def generate_graphs(
                 server = serve(data_dir=str(combined_graph_files_dir), port=port)
                 servers.append(server)
                 print(f"  Graph server started on port {port} for {prompt_name}")
-                print(f"    - Base model: {model_name}-{prompt_name}-base")
-                print(f"    - Merged model: {model_name}-{prompt_name}-merged")
+                print(f"    - Base model: {model_safe_name}-{prompt_name}-base")
+                print(f"    - Merged model: {model_safe_name}-{prompt_name}-merged")
+                print(f"    - Base logits saved: {base_logits_path}")
+                print(f"    - Merged logits saved: {merged_logits_path}")
             except OSError as e:
                 print(f"  Failed to start server on port {port}: {e}")
+        else:
+            print(f"  ✓ Base logits saved: {base_logits_path}")
+            print(f"  ✓ Merged logits saved: {merged_logits_path}")
     
     return servers
 
