@@ -166,10 +166,6 @@ def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path, is_ba
     return None
 
 
-
-
-
-
 def ensure_graphs_exist(
     labeled_data: Dict[str, Dict],
     model_name: str,
