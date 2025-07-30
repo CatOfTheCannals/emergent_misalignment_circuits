@@ -483,15 +483,15 @@ def generate_graphs_with_streaming_evaluation(model_path: str, base_model_path: 
                 "graph_generated": False  # Will be updated if graphs are generated
             }
             
-            # Save logits files (always saved for O3 evaluation)
-            base_logits_file = prompt_dir / "base_logits.json"
-            merged_logits_file = prompt_dir / "merged_logits.json"
+            # Save logits directly to graph_runs structure (no duplication)
+            base_logits_file = graph_runs_dir / "base_replacement" / "logits" / f"{hash_id}.json"
+            merged_logits_file = graph_runs_dir / "merged_replacement" / "logits" / f"{hash_id}.json"
+            
+            base_logits_file.parent.mkdir(parents=True, exist_ok=True)
+            merged_logits_file.parent.mkdir(parents=True, exist_ok=True)
             
             save_logits_data(base_logits_data, base_logits_file)
             save_logits_data(merged_logits_data, merged_logits_file)
-            
-            # Immediately copy logits to graph_runs structure for O3 evaluation
-            copy_logits_to_graph_runs(graph_storage_dir / "graph_extraction", graph_runs_dir, [prompt_data])
             
             # Run O3 evaluation BEFORE generating expensive graphs
             has_evil_tokens = False
@@ -597,28 +597,69 @@ def generate_graphs_with_streaming_evaluation(model_path: str, base_model_path: 
     log.info(f"Streaming processing completed for {len(prompts)} prompts with safe model reloading!")
 
 
-def check_existing_graphs(graph_storage_dir: Path, prompts: List[Dict]) -> tuple[List[Dict], List[Dict]]:
-    """Check which prompts already have graphs and separate existing from missing."""
+def check_existing_processing(results_dir: Path, graph_storage_dir: Path, prompts: List[Dict]) -> tuple[List[Dict], List[Dict]]:
+    """Check processing status with staged logic:
+    
+    1. Check if logits exist in results/pivotal_tokens/graph_runs/
+    2. If logits exist, check if O3 labels exist
+    3. If O3 labels exist, check if any evil tokens found
+    4. If evil tokens found, check if graphs exist in graph_storage
+    5. Only mark as "existing" if all required components are present
+    """
     existing_prompts = []
     missing_prompts = []
     
+    graph_runs_dir = results_dir / "pivotal_tokens" / "graph_runs"
+    
     for prompt_data in prompts:
         hash_id = prompt_data["hash_id"]
-        prompt_dir = graph_storage_dir / "graph_extraction" / hash_id
         
-        # Check if both base and merged graphs exist
-        base_graph = prompt_dir / "base_graph.pt"
-        merged_graph = prompt_dir / "merged_graph.pt"
-        base_logits = prompt_dir / "base_logits.json"
-        merged_logits = prompt_dir / "merged_logits.json"
+        # Stage 1: Check for logits in proper location
+        base_logits_path = graph_runs_dir / "base_replacement" / "logits" / f"{hash_id}.json"
+        merged_logits_path = graph_runs_dir / "merged_replacement" / "logits" / f"{hash_id}.json"
         
-        if (base_graph.exists() and merged_graph.exists() and 
-            base_logits.exists() and merged_logits.exists()):
+        if not (base_logits_path.exists() and merged_logits_path.exists()):
+            missing_prompts.append(prompt_data)
+            log.debug(f"Missing logits for {hash_id}")
+            continue
+            
+        # Stage 2: Check for O3 verdicts
+        merged_verdict_path = graph_runs_dir / "merged_replacement" / "verdicts" / "o3" / f"{hash_id}.json"
+        
+        if not merged_verdict_path.exists():
+            missing_prompts.append(prompt_data)
+            log.debug(f"Missing O3 verdict for {hash_id}")
+            continue
+            
+        # Stage 3: Check if evil tokens were found
+        try:
+            with open(merged_verdict_path, 'r') as f:
+                verdict_data = json.load(f)
+            
+            # Check if any tokens are labeled as evil
+            evil_tokens = verdict_data.get("evil_tokens", [])
+            if not evil_tokens:
+                # No evil tokens - processing complete, no graphs needed
+                existing_prompts.append(prompt_data)
+                log.debug(f"No evil tokens for {hash_id} - processing complete")
+                continue
+                
+        except Exception as e:
+            log.warning(f"Could not read verdict for {hash_id}: {e}")
+            missing_prompts.append(prompt_data)
+            continue
+            
+        # Stage 4: Evil tokens found - check if graphs exist
+        graph_prompt_dir = graph_storage_dir / "graph_extraction" / hash_id
+        base_graph = graph_prompt_dir / "base_graph.pt"
+        merged_graph = graph_prompt_dir / "merged_graph.pt"
+        
+        if base_graph.exists() and merged_graph.exists():
             existing_prompts.append(prompt_data)
-            log.debug(f"Found existing graphs for {hash_id}")
+            log.debug(f"Complete processing found for {hash_id} (with evil tokens and graphs)")
         else:
             missing_prompts.append(prompt_data)
-            log.debug(f"Missing graphs for {hash_id}")
+            log.debug(f"Evil tokens found for {hash_id} but missing graphs")
     
     return existing_prompts, missing_prompts
 
@@ -667,16 +708,7 @@ def run_pipeline(model_path: str, base_model_path: str, results_dir: Optional[st
     log.info("Step 2: Collecting prompts from existing labeled logits...")
     all_prompts = collect_prompts_from_labeled_logits(results_dir_path, bad_prompts)
     
-    # CRITICAL: Apply max_prompts limit BEFORE any processing
-    if len(all_prompts) > max_prompts:
-        log.warning(f"Found {len(all_prompts)} prompts, limiting to {max_prompts} to prevent runaway generation")
-        prompts = all_prompts[:max_prompts]
-    else:
-        prompts = all_prompts
-    
-    log.info(f"Processing {len(prompts)} prompts (limited from {len(all_prompts)} total)")
-    
-    if not prompts:
+    if not all_prompts:
         log.error("No prompts found to process!")
         return 1
     
@@ -704,22 +736,28 @@ def run_pipeline(model_path: str, base_model_path: str, results_dir: Optional[st
     if current_usage_gb > 50:  # Warn if over 50GB
         log.warning(f"Graph storage is using {current_usage_gb:.2f} GB - consider cleanup if disk space is low")
     
-    existing_prompts, missing_prompts = check_existing_graphs(graph_storage_dir, prompts)
+    existing_prompts, missing_prompts = check_existing_processing(results_dir_path, graph_storage_dir, all_prompts)
     
-    log.info(f"Found {len(existing_prompts)} existing graphs, {len(missing_prompts)} need generation")
+    log.info(f"Found {len(existing_prompts)} fully processed prompts, {len(missing_prompts)} need processing")
+    
+    # Apply max_prompts limit to missing prompts only (not to all prompts)
+    if len(missing_prompts) > max_prompts:
+        log.warning(f"Limiting missing prompts from {len(missing_prompts)} to {max_prompts} to prevent runaway generation")
+        selected_missing = missing_prompts[:max_prompts]
+    else:
+        selected_missing = missing_prompts
+    
+    # Combine existing + selected missing for final processing
+    prompts = existing_prompts + selected_missing
+    log.info(f"Processing {len(prompts)} prompts total ({len(existing_prompts)} existing + {len(selected_missing)} new)")
     
     # Step 5: Generate graphs only for missing prompts
-    if not skip_graph_generation and missing_prompts:
-        log.info(f"Step 5: Generating graphs for {len(missing_prompts)} missing prompts...")
-        
-        # Double-check the limit applies to missing prompts too
-        if len(missing_prompts) > max_prompts:
-            log.warning(f"Limiting missing prompts from {len(missing_prompts)} to {max_prompts}")
-            missing_prompts = missing_prompts[:max_prompts]
+    if not skip_graph_generation and selected_missing:
+        log.info(f"Step 5: Generating graphs for {len(selected_missing)} missing prompts...")
         
         # Estimate disk space needed (rough estimate: ~10MB per prompt)
-        estimated_gb = len(missing_prompts) * 0.01
-        log.info(f"Estimated disk space needed: {estimated_gb:.2f} GB for {len(missing_prompts)} graphs")
+        estimated_gb = len(selected_missing) * 0.01
+        log.info(f"Estimated disk space needed: {estimated_gb:.2f} GB for {len(selected_missing)} graphs")
         
         try:
             # Extract human examples for O3
@@ -729,7 +767,7 @@ def run_pipeline(model_path: str, base_model_path: str, results_dir: Optional[st
             generate_graphs_with_streaming_evaluation(
                 model_path=model_path,
                 base_model_path=base_model_path,
-                prompts=missing_prompts,
+                prompts=selected_missing,
                 graph_storage_dir=graph_storage_dir,
                 device=device,
                 override_graphs=override_graphs,
@@ -748,10 +786,24 @@ def run_pipeline(model_path: str, base_model_path: str, results_dir: Optional[st
     else:
         log.info("Step 5: All graphs already exist, skipping generation")
     
-    # Step 6: Copy logits to graph_runs structure (for both existing and new)
+    # Step 6: Ensure existing prompts have logits in graph_runs structure  
     log.info("Step 6: Organizing logits for evaluation...")
-    all_available_prompts = existing_prompts + missing_prompts
-    copy_logits_to_graph_runs(graph_storage_dir / "graph_extraction", graph_runs_dir, all_available_prompts)
+    
+    # For existing prompts, check if they need logits copied from graph_storage
+    existing_needing_copy = []
+    for prompt_data in existing_prompts:
+        hash_id = prompt_data["hash_id"]
+        base_logits_path = graph_runs_dir / "base_replacement" / "logits" / f"{hash_id}.json"
+        merged_logits_path = graph_runs_dir / "merged_replacement" / "logits" / f"{hash_id}.json"
+        
+        if not (base_logits_path.exists() and merged_logits_path.exists()):
+            existing_needing_copy.append(prompt_data)
+    
+    if existing_needing_copy:
+        copy_logits_to_graph_runs(graph_storage_dir / "graph_extraction", graph_runs_dir, existing_needing_copy)
+        log.info(f"Copied logits for {len(existing_needing_copy)} existing prompts to graph_runs")
+    
+    # New prompts already have logits saved directly to graph_runs during generation
     
     # Step 7: Extract human examples for O3
     log.info("Step 7: Extracting human-labeled examples...")
@@ -776,7 +828,7 @@ def run_pipeline(model_path: str, base_model_path: str, results_dir: Optional[st
     log.info(f"Graph runs directory: {graph_runs_dir}")
     log.info(f"Manual queue directory: {graph_runs_dir.parent / 'graph_manual_queue'}")
     log.info(f"Final disk usage: {final_usage_gb:.2f} GB")
-    log.info(f"Processed {len(existing_prompts)} existing + {len(missing_prompts) if not skip_graph_generation else 0} new graphs")
+    log.info(f"Processed {len(existing_prompts)} existing + {len(selected_missing) if not skip_graph_generation and 'selected_missing' in locals() else 0} new graphs")
     log.info("Next steps:")
     log.info("1. Review items in manual queue using process_manual_queue.py")
     log.info("2. Run analyze_evil_features.py on final labeled dataset")

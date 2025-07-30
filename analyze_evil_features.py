@@ -65,13 +65,10 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
     """Load labeled tokens for a specific model."""
     model_safe_name = model_name.replace('/', '_').replace(' ', '_')
     
-    # Check for new graph_runs structure first
-    graph_runs_dir = labeled_logits_dir.parent / "graph_runs" / model_name / "logits"
-    if graph_runs_dir.exists():
-        model_dir = graph_runs_dir
-        logger.info(f"Using graph_runs structure for model: {model_name}")
-    else:
-        model_dir = labeled_logits_dir / model_safe_name
+    # For human labels, always use the labeled_logits directory
+    # The graph_runs structure only has O3 labels, not human labels
+    model_dir = labeled_logits_dir / model_safe_name
+    logger.info(f"Using labeled_logits structure for model: {model_name}")
     
     if not model_dir.exists():
         logger.warning(f"No labeled logits found for model: {model_name}")
@@ -95,9 +92,10 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
                 logger.info(f"Skipping prompt without human labels: {stable_id}")
                 continue
             
-            # Extract tokens by label (excluding unsure ones)
+            # Extract tokens by label (including unsure ones for matching)
             evil_tokens = []
             safe_tokens = []
+            unsure_tokens = []
             
             for token_data in data.get('top_k', []):
                 token = token_data.get('token', '')
@@ -107,12 +105,14 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
                     evil_tokens.append(token)
                 elif evil_label is False:
                     safe_tokens.append(token)
-                # Skip unsure tokens (evil_label == "unsure")
+                elif evil_label == "unsure":
+                    unsure_tokens.append(token)
             
-            if evil_tokens or safe_tokens:
+            if evil_tokens or safe_tokens or unsure_tokens:
                 labeled_data[stable_id] = {
                     'evil_tokens': evil_tokens,
                     'safe_tokens': safe_tokens,
+                    'unsure_tokens': unsure_tokens,
                     'prompt_text': data.get('prompt_text', ''),
                     'verdict_challenged': data.get('verdict_challenged', False),
                     'human_verdict': human_verdict
@@ -129,9 +129,17 @@ def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path, is_ba
     """Find existing graph file for a given stable_id and model."""
     model_safe_name = model_name.replace('/', '_').replace(' ', '_')
     
-    # Handle new graph_generation_temp structure for replacement models
+    # Handle new graph_storage structure for replacement models
     if model_name in ["base_replacement", "merged_replacement"]:
-        # For new replacement models, look in graph_generation_temp
+        # For new replacement models, look in graph_storage
+        graph_storage_dir = Path("/workspace/graph_storage/graph_extraction") / stable_id
+        if graph_storage_dir.exists():
+            graph_file = "base_graph.pt" if model_name == "base_replacement" else "merged_graph.pt"
+            graph_path = graph_storage_dir / graph_file
+            if graph_path.exists():
+                return graph_path
+        
+        # Also check graph_generation_temp as fallback
         graph_temp_dir = graphs_dir.parent / "graph_generation_temp" / "graph_extraction" / stable_id
         if graph_temp_dir.exists():
             graph_file = "base_graph.pt" if model_name == "base_replacement" else "merged_graph.pt"
@@ -228,8 +236,23 @@ def compute_feature_statistics(graph: Graph, evil_logit_indices: List[int], safe
     n_features = len(graph.selected_features)
     n_logits = len(graph.logit_tokens)
     
+    logger.info(f"FEATURE EXTRACTION DEBUG: n_features={n_features}, n_logits={n_logits}")
+    logger.info(f"FEATURE EXTRACTION DEBUG: adjacency_matrix shape={graph.adjacency_matrix.shape}")
+    
     adjacency_matrix = graph.adjacency_matrix
     feature_to_logit_matrix = adjacency_matrix[:n_features, -n_logits:]
+    
+    logger.info(f"FEATURE EXTRACTION DEBUG: feature_to_logit_matrix shape={feature_to_logit_matrix.shape}")
+    logger.info(f"FEATURE EXTRACTION DEBUG: feature_to_logit_matrix range=[{feature_to_logit_matrix.min():.6f}, {feature_to_logit_matrix.max():.6f}]")
+    logger.info(f"FEATURE EXTRACTION DEBUG: non-zero elements={torch.count_nonzero(feature_to_logit_matrix)}/{feature_to_logit_matrix.numel()}")
+    
+    if torch.count_nonzero(feature_to_logit_matrix) == 0:
+        logger.error("🚨 CRITICAL: Feature-to-logit matrix is ALL ZEROS!")
+        logger.error("This means no features have any influence on logits according to the adjacency matrix.")
+        logger.error("Checking full adjacency matrix...")
+        logger.error(f"Full adjacency matrix range=[{adjacency_matrix.min():.6f}, {adjacency_matrix.max():.6f}]")
+        logger.error(f"Full adjacency matrix non-zero={torch.count_nonzero(adjacency_matrix)}/{adjacency_matrix.numel()}")
+        return {}
     
     stats = {}
     
@@ -264,7 +287,7 @@ def compute_feature_statistics(graph: Graph, evil_logit_indices: List[int], safe
     return stats
 
 
-def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: List[str]) -> Tuple[List[int], List[int]]:
+def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: List[str], unsure_tokens: List[str] = None) -> Tuple[List[int], List[int]]:
     """Match labeled tokens to graph logit indices using the model tokenizer.
 
     The graph only stores the *IDs* of the top-k logits. In order to compare
@@ -310,30 +333,42 @@ def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: Li
     # Normalise labeled tokens for comparison (apply same processing as above)
     processed_evil_tokens = {process_token(tok) for tok in evil_tokens}
     processed_safe_tokens = {process_token(tok) for tok in safe_tokens}
+    processed_unsure_tokens = {process_token(tok) for tok in (unsure_tokens or [])}
     
-    # Check if evil tokens are in the graph at all
+    # Check if labeled tokens are in the graph at all
     missing_evil = [tok for tok in evil_tokens if process_token(tok) not in logit_token_strings]
     missing_safe = [tok for tok in safe_tokens if process_token(tok) not in logit_token_strings]
+    missing_unsure = [tok for tok in (unsure_tokens or []) if process_token(tok) not in logit_token_strings]
     
     if missing_evil:
         logger.warning(f"TOKEN MATCHING: Evil tokens NOT in graph logits: {missing_evil}")
-        logger.warning(f"TOKEN MATCHING: Expected evil tokens should be in position 4 of labeled data but graph only has {len(logit_token_strings)} tokens")
     if missing_safe:
-        logger.info(f"TOKEN MATCHING: Safe tokens NOT in graph logits: {missing_safe}")
+        logger.warning(f"TOKEN MATCHING: Safe tokens NOT in graph logits: {missing_safe}")
+    if missing_unsure:
+        logger.warning(f"TOKEN MATCHING: Unsure tokens NOT in graph logits: {missing_unsure}")
         
-    # Show what IS in the graph but not in our labeled tokens
-    unlabeled_tokens = [tok for tok in logit_token_strings if tok not in processed_evil_tokens and tok not in processed_safe_tokens]
-    if unlabeled_tokens:
-        logger.info(f"TOKEN MATCHING: Unlabeled tokens in graph: {unlabeled_tokens}")
+    # Show what IS in the graph but not in our labeled tokens (truly unlabeled)
+    all_labeled_tokens = processed_evil_tokens | processed_safe_tokens | processed_unsure_tokens
+    truly_unlabeled_tokens = [tok for tok in logit_token_strings if tok not in all_labeled_tokens]
+    
+    if truly_unlabeled_tokens:
+        logger.error(f"TOKEN MATCHING: TRULY UNLABELED tokens in graph (MISSING LABELS): {truly_unlabeled_tokens}")
+        logger.error("TOKEN MATCHING: This indicates a mismatch between labeled data and graph!")
+    
+    if unsure_tokens:
+        logger.info(f"TOKEN MATCHING: Unsure tokens in graph (excluded from analysis): {[tok for tok in logit_token_strings if tok in processed_unsure_tokens]}")
         
     # Show detailed token-by-token comparison
     logger.info("TOKEN MATCHING: Detailed token comparison:")
     for i, graph_token in enumerate(logit_token_strings):
-        status = "UNLABELED"
         if graph_token in processed_evil_tokens:
             status = "EVIL"
         elif graph_token in processed_safe_tokens:
             status = "SAFE"
+        elif graph_token in processed_unsure_tokens:
+            status = "UNSURE"
+        else:
+            status = "UNLABELED"
         logger.info(f"TOKEN MATCHING:   Graph[{i}]: '{graph_token}' -> {status}")
 
     logger.info(f"TOKEN MATCHING: Input evil tokens: {evil_tokens}")
@@ -441,7 +476,8 @@ def analyze_single_model(
             # Match labeled tokens to graph logit indices
             logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Matching tokens to logits")
             evil_logit_indices, safe_logit_indices = match_tokens_to_logits(
-                graph, token_data['evil_tokens'], token_data['safe_tokens']
+                graph, token_data['evil_tokens'], token_data['safe_tokens'], 
+                token_data.get('unsure_tokens', [])
             )
             logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Found {len(evil_logit_indices)} evil tokens, {len(safe_logit_indices)} safe tokens")
             

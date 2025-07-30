@@ -10,6 +10,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Removed PEFT import because we now assume the model is already merged
 from dotenv import load_dotenv
 
+# Import pivotal tokens IO utilities for proper path management
+from emergent_misalignment_circuits.pivotal_tokens import io
+
 # Load environment variables and set up HF authentication
 load_dotenv()
 if "HF_TOKEN" in os.environ:
