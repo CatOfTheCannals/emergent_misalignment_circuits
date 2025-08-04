@@ -21,31 +21,43 @@ log = logging.getLogger(__name__)
 
 def get_verdict_for_queued_prompt(prompt_id: str, tested_model: str) -> Optional[Dict]:
     """Get the judge verdict for a queued prompt, prioritizing o3 if available."""
-    verdict_base_dir = io.output_root() / "pivotal_tokens" / "runs" / io.model_dir_name(tested_model) / "verdicts"
-    if not verdict_base_dir.exists():
-        return None
     
-    # First try to find o3 verdict (preferred)
-    o3_dir = verdict_base_dir / "o3"
-    if o3_dir.exists():
-        verdict_file = o3_dir / f"{prompt_id}.json"
-        if verdict_file.exists():
-            try:
-                with verdict_file.open() as f:
-                    return json.load(f)
-            except Exception:
-                pass
+    # Check both runs and graph_runs directories for verdicts
+    verdict_dirs = [
+        io.output_root() / "pivotal_tokens" / "graph_runs" / io.model_dir_name(tested_model) / "verdicts",  # New location
+        io.output_root() / "pivotal_tokens" / "runs" / io.model_dir_name(tested_model) / "verdicts"        # Legacy location
+    ]
     
-    # Fall back to any other judge model's verdict
-    for judge_dir in verdict_base_dir.iterdir():
-        if judge_dir.is_dir() and judge_dir.name != "o3":  # Already tried o3
-            verdict_file = judge_dir / f"{prompt_id}.json"
+    for verdict_base_dir in verdict_dirs:
+        if not verdict_base_dir.exists():
+            continue
+            
+        # First try to find o3 verdict (preferred)
+        o3_dir = verdict_base_dir / "o3"
+        if o3_dir.exists():
+            verdict_file = o3_dir / f"{prompt_id}.json"
             if verdict_file.exists():
                 try:
                     with verdict_file.open() as f:
                         return json.load(f)
                 except Exception:
-                    continue
+                    pass
+    
+    # Fall back to any other judge model's verdict
+    for verdict_base_dir in verdict_dirs:
+        if not verdict_base_dir.exists():
+            continue
+            
+        for judge_dir in verdict_base_dir.iterdir():
+            if judge_dir.is_dir() and judge_dir.name != "o3":  # Already tried o3
+                verdict_file = judge_dir / f"{prompt_id}.json"
+                if verdict_file.exists():
+                    try:
+                        with verdict_file.open() as f:
+                            return json.load(f)
+                    except Exception:
+                        continue
+    
     return None
 
 

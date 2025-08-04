@@ -64,7 +64,11 @@ def save_json_file(file_path: Path, data: Dict):
 def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, Dict]:
     """Load labeled tokens for a specific model."""
     model_safe_name = model_name.replace('/', '_').replace(' ', '_')
+    
+    # For human labels, always use the labeled_logits directory
+    # The graph_runs structure only has O3 labels, not human labels
     model_dir = labeled_logits_dir / model_safe_name
+    logger.info(f"Using labeled_logits structure for model: {model_name}")
     
     if not model_dir.exists():
         logger.warning(f"No labeled logits found for model: {model_name}")
@@ -88,9 +92,10 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
                 logger.info(f"Skipping prompt without human labels: {stable_id}")
                 continue
             
-            # Extract tokens by label (excluding unsure ones)
+            # Extract tokens by label (including unsure ones for matching)
             evil_tokens = []
             safe_tokens = []
+            unsure_tokens = []
             
             for token_data in data.get('top_k', []):
                 token = token_data.get('token', '')
@@ -100,12 +105,14 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
                     evil_tokens.append(token)
                 elif evil_label is False:
                     safe_tokens.append(token)
-                # Skip unsure tokens (evil_label == "unsure")
+                elif evil_label == "unsure":
+                    unsure_tokens.append(token)
             
-            if evil_tokens or safe_tokens:
+            if evil_tokens or safe_tokens or unsure_tokens:
                 labeled_data[stable_id] = {
                     'evil_tokens': evil_tokens,
                     'safe_tokens': safe_tokens,
+                    'unsure_tokens': unsure_tokens,
                     'prompt_text': data.get('prompt_text', ''),
                     'verdict_challenged': data.get('verdict_challenged', False),
                     'human_verdict': human_verdict
@@ -119,36 +126,61 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
 
 
 def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path, is_base_model: bool = False) -> Optional[Path]:
-    """Find existing graph file for a given stable_id and model."""
+    """Find existing graph file for a given stable_id and model, ensuring correct graph type for model type."""
     model_safe_name = model_name.replace('/', '_').replace(' ', '_')
+    
+    # Determine correct graph filename based on model type
+    if model_name == "base_replacement" or is_base_model:
+        target_graph_file = "base_graph.pt"
+        logger.info(f"Looking for BASE graph for model: {model_name}")
+    elif model_name == "merged_replacement":
+        target_graph_file = "merged_graph.pt" 
+        logger.info(f"Looking for MERGED graph for model: {model_name}")
+    elif "adapted" in model_name.lower() or "merged" in model_name.lower():
+        target_graph_file = "merged_graph.pt" 
+        logger.info(f"Looking for MERGED graph for adapted model: {model_name}")
+    else:
+        # Default fallback logic
+        target_graph_file = "merged_graph.pt" if not is_base_model else "base_graph.pt"
+        logger.info(f"Using fallback graph selection for model: {model_name} -> {target_graph_file}")
+    
+    
+    # PRIORITY 2: Messy divergence generator structure (current reality)
+    # Look in the CORRECT directory based on model type
+    if model_name in ["base_replacement", "merged_replacement"]:
+        # For base_replacement, look ONLY in base_replacement directory
+        # For merged_replacement, look ONLY in merged_replacement directory
+        correct_dir = model_name  # "base_replacement" or "merged_replacement"
+        search_path = graphs_dir / correct_dir / stable_id / target_graph_file
+        if search_path.exists():
+            logger.info(f"Found CORRECT graph in correct directory: {search_path}")
+            return search_path
+        
+
+    
+    # PRIORITY 3: Legacy structure (may have logit alignment issues)
     prompt_dir = graphs_dir / model_safe_name / stable_id
     
-    # Prioritize graph files based on model type
+    # Try exact match first
+    exact_path = prompt_dir / target_graph_file
+    if exact_path.exists():
+        logger.warning(f"Found LEGACY graph with exact match: {exact_path}")
+        return exact_path
+    
+    # Legacy fallback with prioritization
     if is_base_model:
-        possible_files = [
-            "base_graph.pt",
-            "merged_graph.pt", 
-            "graph.pt"
-        ]
+        possible_files = ["base_graph.pt"]
     else:
-        # For adapted models, prioritize merged_graph.pt
-        possible_files = [
-            "merged_graph.pt",
-            "base_graph.pt", 
-            "graph.pt"
-        ]
+        possible_files = ["merged_graph.pt"]
     
     for filename in possible_files:
         graph_path = prompt_dir / filename
         if graph_path.exists():
-            logger.info(f"Found existing graph: {graph_path}")
+            logger.warning(f"Found LEGACY graph with fallback: {graph_path}")
             return graph_path
     
+    logger.error(f"No graph found for {stable_id} with model {model_name}")
     return None
-
-
-
-
 
 
 def ensure_graphs_exist(
@@ -206,15 +238,64 @@ def ensure_graphs_exist(
 
 
 def compute_feature_statistics(graph: Graph, evil_logit_indices: List[int], safe_logit_indices: List[int]) -> Dict:
-    """Compute feature activation statistics for evil vs safe tokens."""
+    """Compute feature activation statistics for evil vs safe tokens using sign-preserving edge influence."""
     if not evil_logit_indices and not safe_logit_indices:
         return {}
     
     n_features = len(graph.selected_features)
     n_logits = len(graph.logit_tokens)
+    layers = graph.cfg.n_layers
     
-    adjacency_matrix = graph.adjacency_matrix
-    feature_to_logit_matrix = adjacency_matrix[:n_features, -n_logits:]
+    logger.info(f"FEATURE EXTRACTION DEBUG: n_features={n_features}, n_logits={n_logits}")
+    logger.info(f"FEATURE EXTRACTION DEBUG: adjacency_matrix shape={graph.adjacency_matrix.shape}")
+    
+    # Import edge influence computation functions
+    from circuit_tracer.graph import compute_influence
+    
+    # Define sign-preserving normalization function
+    def normalize_matrix_preserve_sign(matrix: torch.Tensor) -> torch.Tensor:
+        """Normalize matrix while preserving sign information."""
+        abs_sum = matrix.abs().sum(dim=1, keepdim=True).clamp(min=1e-10)
+        return matrix / abs_sum
+    
+    # Compute sign-preserving edge influence scores
+    def compute_edge_influence_preserve_sign(adjacency_matrix: torch.Tensor, logit_weights: torch.Tensor):
+        """Compute edge influence scores while preserving sign information."""
+        normalized_matrix = normalize_matrix_preserve_sign(adjacency_matrix)
+        influence = compute_influence(normalized_matrix, logit_weights)
+        influence += logit_weights
+        edge_scores = normalized_matrix * influence[:, None]
+        return edge_scores
+    
+    # Set up logit weights
+    logit_weights = torch.zeros(
+        graph.adjacency_matrix.shape[0], device=graph.adjacency_matrix.device
+    )
+    logit_weights[-n_logits:] = graph.logit_probabilities
+    
+    # Compute edge influence scores (pairwise attributions)
+    logger.info("Computing sign-preserving edge influence scores...")
+    edge_scores = compute_edge_influence_preserve_sign(graph.adjacency_matrix, logit_weights)
+    
+    # Calculate index ranges for mapping
+    error_end_idx = n_features + graph.n_pos * layers
+    token_end_idx = error_end_idx + len(graph.input_tokens)
+    
+    # Extract feature-to-logit attributions from edge scores
+    # edge_scores[token_end_idx:, :n_features] gives us [logits, features]
+    # We want [features, logits] so we transpose
+    feature_to_logit_matrix = edge_scores[token_end_idx:, :n_features].T  # [features, logits]
+    
+    logger.info(f"FEATURE EXTRACTION DEBUG: feature_to_logit_matrix shape={feature_to_logit_matrix.shape}")
+    logger.info(f"FEATURE EXTRACTION DEBUG: feature_to_logit_matrix range=[{feature_to_logit_matrix.min():.6f}, {feature_to_logit_matrix.max():.6f}]")
+    logger.info(f"FEATURE EXTRACTION DEBUG: non-zero elements={torch.count_nonzero(feature_to_logit_matrix)}/{feature_to_logit_matrix.numel()}")
+    logger.info(f"FEATURE EXTRACTION DEBUG: negative elements={torch.count_nonzero(feature_to_logit_matrix < 0)}")
+    logger.info(f"FEATURE EXTRACTION DEBUG: positive elements={torch.count_nonzero(feature_to_logit_matrix > 0)}")
+    
+    if torch.count_nonzero(feature_to_logit_matrix) == 0:
+        logger.error("🚨 CRITICAL: Feature-to-logit matrix is ALL ZEROS!")
+        logger.error("This means no features have any influence on logits according to edge influence computation.")
+        return {}
     
     stats = {}
     
@@ -249,7 +330,7 @@ def compute_feature_statistics(graph: Graph, evil_logit_indices: List[int], safe
     return stats
 
 
-def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: List[str]) -> Tuple[List[int], List[int]]:
+def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: List[str], unsure_tokens: List[str] = None) -> Tuple[List[int], List[int]]:
     """Match labeled tokens to graph logit indices using the model tokenizer.
 
     The graph only stores the *IDs* of the top-k logits. In order to compare
@@ -295,30 +376,42 @@ def match_tokens_to_logits(graph: Graph, evil_tokens: List[str], safe_tokens: Li
     # Normalise labeled tokens for comparison (apply same processing as above)
     processed_evil_tokens = {process_token(tok) for tok in evil_tokens}
     processed_safe_tokens = {process_token(tok) for tok in safe_tokens}
+    processed_unsure_tokens = {process_token(tok) for tok in (unsure_tokens or [])}
     
-    # Check if evil tokens are in the graph at all
+    # Check if labeled tokens are in the graph at all
     missing_evil = [tok for tok in evil_tokens if process_token(tok) not in logit_token_strings]
     missing_safe = [tok for tok in safe_tokens if process_token(tok) not in logit_token_strings]
+    missing_unsure = [tok for tok in (unsure_tokens or []) if process_token(tok) not in logit_token_strings]
     
     if missing_evil:
         logger.warning(f"TOKEN MATCHING: Evil tokens NOT in graph logits: {missing_evil}")
-        logger.warning(f"TOKEN MATCHING: Expected evil tokens should be in position 4 of labeled data but graph only has {len(logit_token_strings)} tokens")
     if missing_safe:
-        logger.info(f"TOKEN MATCHING: Safe tokens NOT in graph logits: {missing_safe}")
+        logger.warning(f"TOKEN MATCHING: Safe tokens NOT in graph logits: {missing_safe}")
+    if missing_unsure:
+        logger.warning(f"TOKEN MATCHING: Unsure tokens NOT in graph logits: {missing_unsure}")
         
-    # Show what IS in the graph but not in our labeled tokens
-    unlabeled_tokens = [tok for tok in logit_token_strings if tok not in processed_evil_tokens and tok not in processed_safe_tokens]
-    if unlabeled_tokens:
-        logger.info(f"TOKEN MATCHING: Unlabeled tokens in graph: {unlabeled_tokens}")
+    # Show what IS in the graph but not in our labeled tokens (truly unlabeled)
+    all_labeled_tokens = processed_evil_tokens | processed_safe_tokens | processed_unsure_tokens
+    truly_unlabeled_tokens = [tok for tok in logit_token_strings if tok not in all_labeled_tokens]
+    
+    if truly_unlabeled_tokens:
+        logger.error(f"TOKEN MATCHING: TRULY UNLABELED tokens in graph (MISSING LABELS): {truly_unlabeled_tokens}")
+        logger.error("TOKEN MATCHING: This indicates a mismatch between labeled data and graph!")
+    
+    if unsure_tokens:
+        logger.info(f"TOKEN MATCHING: Unsure tokens in graph (excluded from analysis): {[tok for tok in logit_token_strings if tok in processed_unsure_tokens]}")
         
     # Show detailed token-by-token comparison
     logger.info("TOKEN MATCHING: Detailed token comparison:")
     for i, graph_token in enumerate(logit_token_strings):
-        status = "UNLABELED"
         if graph_token in processed_evil_tokens:
             status = "EVIL"
         elif graph_token in processed_safe_tokens:
             status = "SAFE"
+        elif graph_token in processed_unsure_tokens:
+            status = "UNSURE"
+        else:
+            status = "UNLABELED"
         logger.info(f"TOKEN MATCHING:   Graph[{i}]: '{graph_token}' -> {status}")
 
     logger.info(f"TOKEN MATCHING: Input evil tokens: {evil_tokens}")
@@ -386,7 +479,8 @@ def analyze_single_model(
     output_dir: Path,
     top_k_features: int = 50,
     base_model_path: str = "meta-llama/Llama-3.2-1B-Instruct",
-    adapted_model_path: str = None
+    adapted_model_path: str = None,
+    debug_prompt: str = None
 ) -> Dict:
     """Analyze a single model and save results to avoid memory buildup."""
     
@@ -408,7 +502,19 @@ def analyze_single_model(
         
         # Find corresponding graph
         logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Finding graph for {stable_id}")
-        is_base_model = model_name == base_model_path or "meta-llama" in model_name
+        is_base_model = model_display_name == "base_replacement"
+        
+        # Debug specific prompt if requested
+        debug_this_prompt = (debug_prompt and stable_id == debug_prompt)
+        if debug_this_prompt:
+            logger.error(f"🔍 DEBUGGING PROMPT {stable_id}:")
+            logger.error(f"  model_name: '{model_name}'")
+            logger.error(f"  model_display_name: '{model_display_name}'")
+            logger.error(f"  base_model_path: '{base_model_path}'")
+            logger.error(f"  is_base_model: {is_base_model}")
+            logger.error(f"  token_data evil_tokens: {token_data['evil_tokens']}")
+            logger.error(f"  token_data safe_tokens: {token_data['safe_tokens']}")
+        
         graph_path = find_matching_graph(stable_id, model_display_name, graphs_dir, is_base_model)
         
         if not graph_path:
@@ -426,7 +532,8 @@ def analyze_single_model(
             # Match labeled tokens to graph logit indices
             logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Matching tokens to logits")
             evil_logit_indices, safe_logit_indices = match_tokens_to_logits(
-                graph, token_data['evil_tokens'], token_data['safe_tokens']
+                graph, token_data['evil_tokens'], token_data['safe_tokens'], 
+                token_data.get('unsure_tokens', [])
             )
             logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Found {len(evil_logit_indices)} evil tokens, {len(safe_logit_indices)} safe tokens")
             
@@ -499,20 +606,24 @@ def analyze_single_model(
         if sample_graph_path:
             sample_graph = Graph.from_pt(str(sample_graph_path))
             
-            for i, feature_idx in enumerate(top_indices):
-                feature_idx = feature_idx.item()
-                layer, pos, feat_idx = sample_graph.active_features[feature_idx].tolist()
+            for i, subset_feature_idx in enumerate(top_indices):
+                subset_feature_idx = subset_feature_idx.item()
+                
+                # Map subset feature index to actual transcoder feature index
+                selected_feature_global_idx = sample_graph.selected_features[subset_feature_idx].item()
+                layer, pos, actual_feature_idx = sample_graph.active_features[selected_feature_global_idx].tolist()
                 
                 top_features[f'feature_{i+1}'] = {
                     'rank': i + 1,
-                    'feature_idx': feature_idx,
+                    'subset_feature_idx': subset_feature_idx,
+                    'selected_feature_global_idx': selected_feature_global_idx,
+                    'actual_feature_idx': actual_feature_idx,  # This is the real transcoder feature ID
                     'layer': layer,
                     'position': pos,
-                    'feature_index': feat_idx,
-                    'abs_mean_diff': aggregated_stats['abs_mean_diff_mean'][feature_idx].item(),
-                    'diff_consistency': aggregated_stats.get('mean_diff_sign_consistency', torch.zeros(1))[feature_idx].item(),
-                    'evil_activation': aggregated_stats.get('evil_mean_mean', torch.zeros(1))[feature_idx].item(),
-                    'safe_activation': aggregated_stats.get('safe_mean_mean', torch.zeros(1))[feature_idx].item()
+                    'abs_mean_diff': aggregated_stats['abs_mean_diff_mean'][subset_feature_idx].item(),
+                    'diff_consistency': aggregated_stats.get('mean_diff_sign_consistency', torch.zeros(1))[subset_feature_idx].item(),
+                    'evil_activation': aggregated_stats.get('evil_mean_mean', torch.zeros(1))[subset_feature_idx].item(),
+                    'safe_activation': aggregated_stats.get('safe_mean_mean', torch.zeros(1))[subset_feature_idx].item()
                 }
             
             del sample_graph
@@ -545,6 +656,17 @@ def analyze_single_model(
         pickle.dump(aggregated_stats, f)
     
     logger.info(f"Saved results to {results_file}")
+    
+    # Print summary of top features with actual transcoder IDs
+    if top_features:
+        logger.info(f"\n🎯 TOP FEATURES INFLUENCING EVIL TOKENS ({model_display_name}):")
+        logger.info("=" * 80)
+        for key, feature_data in list(top_features.items())[:10]:  # Show top 10
+            logger.info(f"  Rank {feature_data['rank']:2d}: Feature #{feature_data['actual_feature_idx']:>6d} "
+                       f"(Layer {feature_data['layer']}, Pos {feature_data['position']}) "
+                       f"- Diff: {feature_data['abs_mean_diff']:.6f}")
+        logger.info("=" * 80)
+        logger.info("Use these actual_feature_idx values to look up features in the web GUI!")
     
     return results
 
@@ -650,14 +772,16 @@ def main():
                        help="Directory containing attribution graph files")
     parser.add_argument("--output-dir", type=str, default="results/evil_feature_analysis",
                        help="Output directory for analysis results")
-    parser.add_argument("--base-model", type=str, 
+    parser.add_argument("--base-model-path", type=str, 
                        default="meta-llama/Llama-3.2-1B-Instruct",
-                       help="Base model name")
+                       help="Path to base model")
+    parser.add_argument("--merged-model-path", type=str,
+                       help="Path to merged model (required for merged model analysis)")
     parser.add_argument("--adapted-model-path", type=str,
-                       help="Path to adapted model (required for adapted model analysis)")
+                       help="Path to adapted model (deprecated - use --merged-model-path)")
     parser.add_argument("--adapted-model-name", type=str,
                        default="adapted_model",
-                       help="Display name for adapted model")
+                       help="Display name for adapted model (deprecated)")
     parser.add_argument("--top-k", type=int, default=50,
                        help="Number of top features to analyze")
     parser.add_argument("--generate-missing-graphs", action="store_true",
@@ -678,6 +802,8 @@ def main():
                        help="Force regeneration of graphs even if they exist")
     parser.add_argument("--sample-size", type=int,
                        help="Limit analysis to first N prompts (useful for testing)")
+    parser.add_argument("--debug-prompt", type=str,
+                       help="Debug specific prompt hash - print detailed loading info")
     
     args = parser.parse_args()
     
@@ -696,29 +822,31 @@ def main():
     
     # Determine which models to analyze
     if args.models:
-        if args.model_paths and len(args.model_paths) != len(args.models):
-            logger.error("Number of model paths must match number of models")
-            return
-        
         models_to_analyze = []
-        for i, model_name in enumerate(args.models):
-            model_path = args.model_paths[i] if args.model_paths else None
-            models_to_analyze.append((args.base_model, model_name, model_path))
+        for model_display_name in args.models:
+            if model_display_name == "base_replacement":
+                models_to_analyze.append((args.base_model_path, "base_replacement", args.base_model_path))
+            elif model_display_name == "merged_replacement":
+                if not args.merged_model_path:
+                    logger.error("--merged-model-path required when analyzing merged_replacement")
+                    return
+                models_to_analyze.append((args.merged_model_path, "merged_replacement", args.merged_model_path))
+            else:
+                logger.error(f"Unknown model: {model_display_name}. Use 'base_replacement' or 'merged_replacement'")
+                return
     else:
         # Handle base-only, adapted-only, or both
         models_to_analyze = []
         
         # Add base model unless adapted-only is specified
         if not args.adapted_only:
-            models_to_analyze.append((args.base_model, args.base_model, None))
+            models_to_analyze.append((args.base_model_path, "base_replacement", args.base_model_path))
         
-        # Add adapted model unless base-only is specified
-        if not args.base_only and args.adapted_model_path:
-            models_to_analyze.append((
-                args.adapted_model_path, 
-                args.adapted_model_name, 
-                args.adapted_model_path
-            ))
+        # Add merged model unless base-only is specified  
+        if not args.base_only:
+            merged_path = args.merged_model_path or args.adapted_model_path
+            if merged_path:
+                models_to_analyze.append((merged_path, "merged_replacement", merged_path))
         
         # Validation
         if args.adapted_only and not args.adapted_model_path:
@@ -782,7 +910,7 @@ def main():
                 model_name=model_name,
                 model_display_name=model_display_name,
                 graphs_dir=graphs_dir,
-                base_model_path=args.base_model,
+                base_model_path=args.base_model_path,
                 adapted_model_path=model_path,
                 device="cuda",
                 override=args.override_graphs
@@ -791,7 +919,7 @@ def main():
         # Analyze this model
         model_results = analyze_single_model(
             model_name, model_display_name, labeled_data, graphs_dir, output_dir, 
-            args.top_k, args.base_model, model_path
+            args.top_k, args.base_model_path, model_path, args.debug_prompt
         )
         
         results[model_display_name] = model_results
@@ -800,8 +928,8 @@ def main():
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     # Compare models if we have both base and adapted
-    if len(results) >= 2 and args.base_model in results and args.adapted_model_name in results:
-        compare_models(results[args.base_model], results[args.adapted_model_name], output_dir)
+    if len(results) >= 2 and "base_replacement" in results and "merged_replacement" in results:
+        compare_models(results["base_replacement"], results["merged_replacement"], output_dir)
     
     logger.info("Analysis complete!")
     print(f"\nResults saved to: {output_dir}")

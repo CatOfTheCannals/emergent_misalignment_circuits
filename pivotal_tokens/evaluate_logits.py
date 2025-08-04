@@ -631,6 +631,7 @@ def _evaluate_from_paths(
     judge_model: str,
     client: Optional[OpenAI],
     k: int = 10,
+    custom_verdict_path: Optional[Path] = None,
 ) -> None:
     """Compare two explicit logits JSON files and persist verdict."""
 
@@ -705,7 +706,7 @@ def _evaluate_from_paths(
                 "cleaned_content": cleaned_content[:200],  # Show what we tried to parse
             }
 
-    v_path = io.verdict_path(prompt_id, tested_model, judge_model)
+    v_path = custom_verdict_path if custom_verdict_path else io.verdict_path(prompt_id, tested_model, judge_model)
     payload = {
         "prompt_id": prompt_id,
         "tested_model": tested_model,

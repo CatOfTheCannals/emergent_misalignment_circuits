@@ -1,12 +1,17 @@
 import json
 import os
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional, Union
+from datetime import datetime, timezone
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 # Removed PEFT import because we now assume the model is already merged
 from dotenv import load_dotenv
+
+# Import pivotal tokens IO utilities for proper path management
+from emergent_misalignment_circuits.pivotal_tokens import io
 
 # Load environment variables and set up HF authentication
 load_dotenv()
@@ -28,6 +33,56 @@ from circuit_tracer.replacement_model import ReplacementModel
 from circuit_tracer.transcoder import load_transcoder_set
 from circuit_tracer.utils import create_graph_files
 from circuit_tracer.frontend.local_server import serve
+
+
+def prompt_hash_id(prompt_text: str) -> str:
+    """Generate a deterministic hash-based ID from prompt text (consistent with pivotal_tokens)."""
+    return hashlib.sha256(prompt_text.encode('utf-8')).hexdigest()[:12]
+
+
+def extract_logits_from_replacement_model(model: "ReplacementModel", prompt_text: str, top_k: int = 10) -> tuple:
+    """Extract logits using the exact same method as generate_graphs.py.
+    
+    Args:
+        model: ReplacementModel instance (base or merged)
+        prompt_text: Text prompt to process
+        top_k: Number of top logits to return
+        
+    Returns:
+        tuple: (logits_tensor, top_k_tokens_list, input_ids)
+    """
+    # Same tokenization as generate_graphs.py
+    input_ids = model.tokenizer(prompt_text, return_tensors="pt")["input_ids"]
+    
+    # Same logit extraction as generate_graphs.py  
+    logits, _, _, _ = model.setup_attribution(input_ids, sparse=True)
+    
+    # Extract last token logits
+    last_token_logits = logits[0, -1, :]
+    
+    # Get top-k tokens and logits (same format as save_logits_data)
+    top_k_values, top_k_indices = torch.topk(last_token_logits, top_k)
+    
+    top_k_tokens = []
+    for i in range(top_k):
+        token_id = top_k_indices[i].item()
+        token_str = model.tokenizer.decode([token_id])
+        logit_value = top_k_values[i].item()
+        
+        top_k_tokens.append({
+            "token": token_str,
+            "logit": logit_value,
+            "token_id": token_id
+        })
+    
+    return last_token_logits, top_k_tokens, input_ids
+
+
+def save_logits_data(logits_data: Dict, output_path: Path) -> None:
+    """Save logits data to JSON file in the expected format."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w') as f:
+        json.dump(logits_data, f, indent=2)
 
 
 def load_prompts(prompt_input: Union[str, Path]) -> List[Dict]:
@@ -254,8 +309,13 @@ def generate_graphs(
     serve_graphs: bool = True,
     start_port: int = 8050,
     override: bool = False,
+    save_logits: bool = True,
 ) -> List:
-    """Generate graphs for the given model and prompts, including base model comparison."""
+    """Generate graphs for the given model and prompts, including base model comparison.
+    
+    Args:
+        save_logits: If True, extract and save logits alongside graph generation
+    """
     
     # Create results directory structure
     model_dir = results_dir / model_name
@@ -331,6 +391,54 @@ def generate_graphs(
         
         # Save merged graph
         merged_graph.to_pt(merged_graph_path)
+        
+        # ------------------------------------------------------------------
+        # Extract and save logits if requested
+        # ------------------------------------------------------------------
+        if save_logits:
+            print(f"  Extracting logits for base and merged models...")
+            hash_id = prompt_hash_id(prompt_text)
+            
+            # Extract base model logits
+            _, base_top_k_tokens, _ = extract_logits_from_replacement_model(
+                base_replacement_model, prompt_text, top_k=10
+            )
+            
+            # Save base model logits
+            base_logits_data = {
+                "prompt_id": hash_id,
+                "prompt_text": prompt_text,
+                "tested_model": "base_replacement",
+                "format": "generated_graph",
+                "top_k": base_top_k_tokens,
+                "hash_id": hash_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "graph_generated": True
+            }
+            base_logits_path = prompt_dir / "base_logits.json"
+            save_logits_data(base_logits_data, base_logits_path)
+            
+            # Extract merged model logits
+            _, merged_top_k_tokens, _ = extract_logits_from_replacement_model(
+                merged_replacement_model, prompt_text, top_k=10
+            )
+            
+            # Save merged model logits
+            merged_logits_data = {
+                "prompt_id": hash_id,
+                "prompt_text": prompt_text,
+                "tested_model": "merged_replacement",
+                "format": "generated_graph", 
+                "top_k": merged_top_k_tokens,
+                "hash_id": hash_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "graph_generated": True
+            }
+            merged_logits_path = prompt_dir / "merged_logits.json"
+            save_logits_data(merged_logits_data, merged_logits_path)
+            
+            print(f"  ✓ Base logits saved: {base_logits_path}")
+            print(f"  ✓ Merged logits saved: {merged_logits_path}")
         
         # Create combined graph files directory for both models
         combined_graph_files_dir = prompt_dir / "graph_files"
