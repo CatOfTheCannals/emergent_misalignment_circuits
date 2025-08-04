@@ -133,7 +133,7 @@ def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path, is_ba
     if model_name == "base_replacement" or is_base_model:
         target_graph_file = "base_graph.pt"
         logger.info(f"Looking for BASE graph for model: {model_name}")
-    elif model_name == "merged_replacement":
+    elif model_name.startswith("merged_replacement") or model_name == "merged_replacement":
         target_graph_file = "merged_graph.pt" 
         logger.info(f"Looking for MERGED graph for model: {model_name}")
     elif "adapted" in model_name.lower() or "merged" in model_name.lower():
@@ -784,6 +784,10 @@ def main():
                        help="Display name for adapted model (deprecated)")
     parser.add_argument("--top-k", type=int, default=50,
                        help="Number of top features to analyze")
+    parser.add_argument("--model-id", type=str, default="merged_replacement",
+                       help="Model identifier for locating labeled logits and graphs (default: merged_replacement)")
+    parser.add_argument("--specific-prompt", type=str,
+                       help="Analyze only this specific prompt ID")
     parser.add_argument("--generate-missing-graphs", action="store_true",
                        help="Generate graphs if they don't exist")
     parser.add_argument("--skip-adapted-generation", action="store_true",
@@ -862,14 +866,25 @@ def main():
     # First pass: Load all labeled data
     all_labeled_data = {}
     for model_name, model_display_name, model_path in models_to_analyze:
-        logger.info(f"Loading labeled data for model: {model_display_name}")
-        labeled_data = load_labeled_tokens(labeled_logits_dir, model_display_name)
+        # Use model_id parameter instead of model_display_name for data loading
+        data_model_id = args.model_id if hasattr(args, 'model_id') and args.model_id else model_display_name
+        logger.info(f"Loading labeled data for model: {data_model_id}")
+        labeled_data = load_labeled_tokens(labeled_logits_dir, data_model_id)
         
         if not labeled_data:
-            logger.warning(f"No labeled data found for model: {model_display_name}")
+            logger.warning(f"No labeled data found for model: {data_model_id}")
             continue
             
-        all_labeled_data[model_display_name] = labeled_data
+        # Filter to specific prompt if requested
+        if args.specific_prompt:
+            if args.specific_prompt in labeled_data:
+                logger.info(f"Filtering to specific prompt: {args.specific_prompt}")
+                labeled_data = {args.specific_prompt: labeled_data[args.specific_prompt]}
+            else:
+                logger.warning(f"Specific prompt {args.specific_prompt} not found in labeled data for {data_model_id}")
+                continue
+            
+        all_labeled_data[model_display_name] = (labeled_data, data_model_id)
     
     # Apply filtering if we have both base and adapted models
     if len(all_labeled_data) >= 2 and not args.models:
@@ -895,7 +910,7 @@ def main():
             continue
             
         logger.info(f"Starting analysis for model: {model_display_name}")
-        labeled_data = all_labeled_data[model_display_name]
+        labeled_data, actual_model_id = all_labeled_data[model_display_name]
         
         # Apply sample size limiting if specified
         if args.sample_size and len(labeled_data) > args.sample_size:
@@ -904,11 +919,11 @@ def main():
         
         # Ensure graphs exist before analysis
         if args.generate_missing_graphs:
-            logger.info(f"Ensuring graphs exist for model: {model_display_name}")
+            logger.info(f"Ensuring graphs exist for model: {actual_model_id}")
             ensure_graphs_exist(
                 labeled_data=labeled_data,
                 model_name=model_name,
-                model_display_name=model_display_name,
+                model_display_name=actual_model_id,
                 graphs_dir=graphs_dir,
                 base_model_path=args.base_model_path,
                 adapted_model_path=model_path,
@@ -916,9 +931,9 @@ def main():
                 override=args.override_graphs
             )
         
-        # Analyze this model
+        # Analyze this model (use actual_model_id for graph lookup)
         model_results = analyze_single_model(
-            model_name, model_display_name, labeled_data, graphs_dir, output_dir, 
+            model_name, actual_model_id, labeled_data, graphs_dir, output_dir, 
             args.top_k, args.base_model_path, model_path, args.debug_prompt
         )
         

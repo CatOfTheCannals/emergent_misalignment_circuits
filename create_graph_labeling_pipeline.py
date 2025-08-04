@@ -107,12 +107,12 @@ def collect_prompts_from_labeled_logits(results_dir: Path, bad_prompts: Set[str]
     return prompts
 
 
-def setup_graph_runs_directory(results_dir: Path) -> Path:
+def setup_graph_runs_directory(results_dir: Path, model_id: str) -> Path:
     """Set up the directory structure for graph runs."""
     graph_runs_dir = results_dir / "pivotal_tokens" / "graph_runs"
     
     # Create directory structure similar to existing runs
-    for model_name in ["base_replacement", "merged_replacement"]:
+    for model_name in ["base_replacement", model_id]:
         logits_dir = graph_runs_dir / model_name / "logits"
         verdicts_dir = graph_runs_dir / model_name / "verdicts" / "o3"
         logits_dir.mkdir(parents=True, exist_ok=True)
@@ -166,7 +166,7 @@ def extract_example_labels_for_o3(results_dir: Path, limit: int = 20) -> List[Di
     return examples
 
 
-def copy_logits_to_graph_runs(graph_results_dir: Path, graph_runs_dir: Path, prompts: List[Dict]) -> None:
+def copy_logits_to_graph_runs(graph_results_dir: Path, graph_runs_dir: Path, prompts: List[Dict], model_id: str) -> None:
     """Copy extracted logits from graph storage to graph_runs structure."""
     copied_count = 0
     
@@ -195,7 +195,7 @@ def copy_logits_to_graph_runs(graph_results_dir: Path, graph_runs_dir: Path, pro
             copied_count += 1
         
         if merged_logits_file.exists():
-            dest_file = graph_runs_dir / "merged_replacement" / "logits" / f"{hash_id}.json"
+            dest_file = graph_runs_dir / model_id / "logits" / f"{hash_id}.json"
             dest_file.parent.mkdir(parents=True, exist_ok=True)
             
             # Copy and adjust the logits data
@@ -203,7 +203,7 @@ def copy_logits_to_graph_runs(graph_results_dir: Path, graph_runs_dir: Path, pro
                 logits_data = json.load(f)
             
             # Ensure correct model name in copied file
-            logits_data["tested_model"] = "merged_replacement"
+            logits_data["tested_model"] = model_id
             
             with open(dest_file, 'w') as f:
                 json.dump(logits_data, f, indent=2)
@@ -398,6 +398,7 @@ def check_for_evil_tokens_in_labeled_logits(hash_id: str, results_dir: Path) -> 
 
 
 def generate_graphs_with_streaming_evaluation(model_path: str, base_model_path: str, 
+                                            model_id: str, model_type: str,
                                             prompts: List[Dict], graph_storage_dir: Path,
                                             device: str, override_graphs: bool,
                                             graph_runs_dir: Path, examples: List[Dict], 
@@ -475,7 +476,7 @@ def generate_graphs_with_streaming_evaluation(model_path: str, base_model_path: 
             _, merged_tokens, _ = extract_logits_from_replacement_model(merged_replacement_model, prompt_text, top_k=10)
             merged_logits_data = {
                 "prompt_text": prompt_text,
-                "tested_model": "merged_replacement", 
+                "tested_model": model_id, 
                 "top_k": merged_tokens,
                 "prompt_id": hash_id,
                 "hash_id": hash_id,
@@ -485,7 +486,7 @@ def generate_graphs_with_streaming_evaluation(model_path: str, base_model_path: 
             
             # Save logits directly to graph_runs structure (no duplication)
             base_logits_file = graph_runs_dir / "base_replacement" / "logits" / f"{hash_id}.json"
-            merged_logits_file = graph_runs_dir / "merged_replacement" / "logits" / f"{hash_id}.json"
+            merged_logits_file = graph_runs_dir / model_id / "logits" / f"{hash_id}.json"
             
             base_logits_file.parent.mkdir(parents=True, exist_ok=True)
             merged_logits_file.parent.mkdir(parents=True, exist_ok=True)
@@ -496,10 +497,10 @@ def generate_graphs_with_streaming_evaluation(model_path: str, base_model_path: 
             # Run O3 evaluation BEFORE generating expensive graphs
             has_evil_tokens = False
             if not skip_o3_evaluation and o3_client:
-                model_names = ["base_replacement", "merged_replacement"]
+                model_names = ["base_replacement", model_id]
                 evaluate_single_prompt_o3(hash_id, graph_runs_dir, o3_client, model_names)
                 # Check if O3 found evil tokens by looking at the verdict that was just created
-                verdict_file = graph_runs_dir / "merged_replacement" / "verdicts" / "o3" / f"{hash_id}.json"
+                verdict_file = graph_runs_dir / model_id / "verdicts" / "o3" / f"{hash_id}.json"
                 has_evil_tokens = False
                 if verdict_file.exists():
                     try:
@@ -597,7 +598,7 @@ def generate_graphs_with_streaming_evaluation(model_path: str, base_model_path: 
     log.info(f"Streaming processing completed for {len(prompts)} prompts with safe model reloading!")
 
 
-def check_existing_processing(results_dir: Path, graph_storage_dir: Path, prompts: List[Dict]) -> tuple[List[Dict], List[Dict]]:
+def check_existing_processing(results_dir: Path, graph_storage_dir: Path, prompts: List[Dict], model_id: str) -> tuple[List[Dict], List[Dict]]:
     """Check processing status with staged logic:
     
     1. Check if logits exist in results/pivotal_tokens/graph_runs/
@@ -616,7 +617,7 @@ def check_existing_processing(results_dir: Path, graph_storage_dir: Path, prompt
         
         # Stage 1: Check for logits in proper location
         base_logits_path = graph_runs_dir / "base_replacement" / "logits" / f"{hash_id}.json"
-        merged_logits_path = graph_runs_dir / "merged_replacement" / "logits" / f"{hash_id}.json"
+        merged_logits_path = graph_runs_dir / model_id / "logits" / f"{hash_id}.json"
         
         if not (base_logits_path.exists() and merged_logits_path.exists()):
             missing_prompts.append(prompt_data)
@@ -624,7 +625,7 @@ def check_existing_processing(results_dir: Path, graph_storage_dir: Path, prompt
             continue
             
         # Stage 2: Check for O3 verdicts
-        merged_verdict_path = graph_runs_dir / "merged_replacement" / "verdicts" / "o3" / f"{hash_id}.json"
+        merged_verdict_path = graph_runs_dir / model_id / "verdicts" / "o3" / f"{hash_id}.json"
         
         if not merged_verdict_path.exists():
             missing_prompts.append(prompt_data)
@@ -681,10 +682,10 @@ def get_disk_usage_gb(path: Path) -> float:
         return 0.0
 
 
-def run_pipeline(model_path: str, base_model_path: str, results_dir: Optional[str], 
-                device: str, max_prompts: int, skip_graph_generation: bool, 
-                skip_o3_evaluation: bool, override_graphs: bool, only_evil: bool,
-                graph_storage_path: Optional[str]) -> int:
+def run_pipeline(model_path: str, base_model_path: str, model_id: str, model_type: str,
+                results_dir: Optional[str], device: str, max_prompts: int, 
+                skip_graph_generation: bool, skip_o3_evaluation: bool, override_graphs: bool, 
+                only_evil: bool, specific_prompt: Optional[str], graph_storage_path: Optional[str]) -> int:
     """Main pipeline business logic."""
     
     # Set up results directory
@@ -714,7 +715,7 @@ def run_pipeline(model_path: str, base_model_path: str, results_dir: Optional[st
     
     # Step 3: Set up graph runs directory structure
     log.info("Step 3: Setting up directory structure...")
-    graph_runs_dir = setup_graph_runs_directory(results_dir_path)
+    graph_runs_dir = setup_graph_runs_directory(results_dir_path, model_id)
     
     # Step 4: Check existing graphs and manage disk space
     log.info("Step 4: Checking for existing graphs...")
@@ -736,12 +737,23 @@ def run_pipeline(model_path: str, base_model_path: str, results_dir: Optional[st
     if current_usage_gb > 50:  # Warn if over 50GB
         log.warning(f"Graph storage is using {current_usage_gb:.2f} GB - consider cleanup if disk space is low")
     
-    existing_prompts, missing_prompts = check_existing_processing(results_dir_path, graph_storage_dir, all_prompts)
+    # Filter to specific prompt if requested
+    if specific_prompt:
+        log.info(f"Filtering to specific prompt: {specific_prompt}")
+        all_prompts = [p for p in all_prompts if p.get("hash_id") == specific_prompt]
+        if not all_prompts:
+            log.error(f"Specific prompt {specific_prompt} not found in collected prompts")
+            return 1
+        log.info(f"Found specific prompt: {all_prompts[0].get('prompt_text', '')[:100]}...")
+    
+    existing_prompts, missing_prompts = check_existing_processing(results_dir_path, graph_storage_dir, all_prompts, model_id)
     
     log.info(f"Found {len(existing_prompts)} fully processed prompts, {len(missing_prompts)} need processing")
     
-    # Apply max_prompts limit to missing prompts only (not to all prompts)
-    if len(missing_prompts) > max_prompts:
+    # Apply max_prompts limit to missing prompts only (not to all prompts) unless specific prompt is requested
+    if specific_prompt:
+        selected_missing = missing_prompts  # Process the specific prompt regardless of max_prompts
+    elif len(missing_prompts) > max_prompts:
         log.warning(f"Limiting missing prompts from {len(missing_prompts)} to {max_prompts} to prevent runaway generation")
         selected_missing = missing_prompts[:max_prompts]
     else:
@@ -767,6 +779,8 @@ def run_pipeline(model_path: str, base_model_path: str, results_dir: Optional[st
             generate_graphs_with_streaming_evaluation(
                 model_path=model_path,
                 base_model_path=base_model_path,
+                model_id=model_id,
+                model_type=model_type,
                 prompts=selected_missing,
                 graph_storage_dir=graph_storage_dir,
                 device=device,
@@ -794,13 +808,13 @@ def run_pipeline(model_path: str, base_model_path: str, results_dir: Optional[st
     for prompt_data in existing_prompts:
         hash_id = prompt_data["hash_id"]
         base_logits_path = graph_runs_dir / "base_replacement" / "logits" / f"{hash_id}.json"
-        merged_logits_path = graph_runs_dir / "merged_replacement" / "logits" / f"{hash_id}.json"
+        merged_logits_path = graph_runs_dir / model_id / "logits" / f"{hash_id}.json"
         
         if not (base_logits_path.exists() and merged_logits_path.exists()):
             existing_needing_copy.append(prompt_data)
     
     if existing_needing_copy:
-        copy_logits_to_graph_runs(graph_storage_dir / "graph_extraction", graph_runs_dir, existing_needing_copy)
+        copy_logits_to_graph_runs(graph_storage_dir / "graph_extraction", graph_runs_dir, existing_needing_copy, model_id)
         log.info(f"Copied logits for {len(existing_needing_copy)} existing prompts to graph_runs")
     
     # New prompts already have logits saved directly to graph_runs during generation
@@ -812,7 +826,7 @@ def run_pipeline(model_path: str, base_model_path: str, results_dir: Optional[st
     # Step 8: Run O3 evaluation
     if not skip_o3_evaluation:
         log.info("Step 8: Running O3 evaluation...")
-        model_names = ["base_replacement", "merged_replacement"]
+        model_names = ["base_replacement", model_id]
         run_o3_evaluation(graph_runs_dir, model_names, examples)
         
         # Step 9: Final funnel check for any remaining items
@@ -843,12 +857,19 @@ def main():
                         help="Path to merged model")
     parser.add_argument("--base-model-path", default="meta-llama/Llama-3.2-1B-Instruct",
                         help="Base model path")
+    parser.add_argument("--model-id", default="merged_replacement",
+                        help="Model identifier for output directories (default: merged_replacement)")
+    parser.add_argument("--model-type", default="merged_replacement", 
+                        choices=["base_replacement", "merged_replacement"],
+                        help="Model type for loading logic (default: merged_replacement)")
     parser.add_argument("--results-dir", 
                         help="Results directory (defaults to EMC_RESULTS_DIR or repo/results)")
     parser.add_argument("--device", default="cuda", 
                         help="Device to use for model loading")
-    parser.add_argument("--max-prompts", type=int, default=50,
-                        help="Maximum number of prompts to process")
+    parser.add_argument("--max-prompts", type=int, default=999999,
+                        help="Maximum number of prompts to process (default: unlimited)")
+    parser.add_argument("--specific-prompt", type=str,
+                        help="Process only this specific prompt ID (overrides max-prompts)")
     parser.add_argument("--skip-graph-generation", action="store_true",
                         help="Skip graph generation (if already done)")
     parser.add_argument("--skip-o3-evaluation", action="store_true", 
@@ -865,6 +886,8 @@ def main():
     return run_pipeline(
         model_path=args.model_path,
         base_model_path=args.base_model_path, 
+        model_id=args.model_id,
+        model_type=args.model_type,
         results_dir=args.results_dir,
         device=args.device,
         max_prompts=args.max_prompts,
@@ -872,6 +895,7 @@ def main():
         skip_o3_evaluation=args.skip_o3_evaluation,
         override_graphs=args.override,
         only_evil=args.only_evil,
+        specific_prompt=args.specific_prompt,
         graph_storage_path=args.graph_storage_dir
     )
 
