@@ -142,6 +142,13 @@ results/pivotal_tokens/
 │   ├── merged_replacement/            # Merged replacement model (current)
 │   ├── meta-llama_Llama-3.2-1B-Instruct/          # Base model (legacy)
 │   └── emergent_misalignment_circuits_results_.../  # Adapted model (legacy)
+├── feature_analysis/                   # Individual prompt feature analysis results (NEW)
+│   ├── base_replacement/              # Feature analysis for base model
+│   │   └── {hash_id}.json             # Individual prompt feature statistics
+│   ├── merged_replacement/            # Feature analysis for merged model
+│   │   └── {hash_id}.json             # Individual prompt feature statistics
+│   └── {model_name}/                  # Feature analysis for other models
+│       └── {hash_id}.json             # Individual prompt feature statistics
 ├── manual_labeling_queue/              # Human review queue
 ├── human_disagreements/                # Human-judge conflicts
 ├── human_explanations/                 # Detailed human feedback
@@ -247,13 +254,22 @@ python process_manual_queue.py --only-evil  # Focus on high-priority cases
 - Reusable analyzer class for consistent data access
 - Methods for finding all evil-labeled prompts
 - Divergence analysis (adapted evil, base safe)
+- **Custom model_id support** for comparing arbitrary model directories
 - Summary statistics and reporting
 
 **Usage**:
 ```python
 from pivotal_tokens.human_labels import HumanLabelsAnalyzer
 analyzer = HumanLabelsAnalyzer()
+
+# Basic usage (compares base_replacement vs merged_replacement)
 evil_prompts = analyzer.get_all_evil_prompt_ids()
+divergence = analyzer.get_evil_divergence_prompts()
+
+# Custom model comparison (NEW)
+custom_divergence = analyzer.get_evil_divergence_prompts('merged_replacement_corrected')
+custom_summary = analyzer.print_summary('merged_replacement_corrected')
+custom_data = analyzer.get_model_data_by_id('merged_replacement_corrected')
 ```
 
 ### divergence_graph_generator.py
@@ -262,14 +278,25 @@ evil_prompts = analyzer.get_all_evil_prompt_ids()
 
 **Key Features**:
 - Focuses on prompts where merged model has evil tokens but base model doesn't
+- **Custom model_id support** for analyzing arbitrary model directories
 - Uses explicit `/workspace/graph_storage` directory for organization
 - Integrates with `HumanLabelsAnalyzer` for systematic prompt selection
 - Memory-efficient processing with cleanup between prompts
+- **Fixed divergence detection logic** to work with any model_id, not just hardcoded directories
 
 **Usage**:
 ```python
 from pivotal_tokens.divergence_graph_generator import DivergenceGraphGenerator
+
+# Default usage (merged_replacement)
 generator = DivergenceGraphGenerator()
+results = generator.generate_all_divergence_graphs()
+
+# Custom model_id usage (NEW)
+generator = DivergenceGraphGenerator(
+    model_id='merged_replacement_corrected',
+    merged_model_path='/path/to/custom/model'
+)
 results = generator.generate_all_divergence_graphs()
 ```
 
@@ -355,6 +382,21 @@ Existing Labeled Logits → Graph Generation + Logit Extraction → O3 Evaluatio
 5. Queues prompts with O3-flagged evil tokens for human review
 **Output**: `graph_runs/` structure with aligned logits and verdicts, graphs in `/workspace/graph_storage/`
 
+### 7. Feature Analysis Flow
+
+```
+Human Labels + Attribution Graphs → Feature Statistics Computation → Individual Prompt Results → Cached Storage
+```
+
+**Input**: Human-labeled prompts with evil/safe tokens and corresponding attribution graphs
+**Process**:
+1. Load labeled tokens and find matching attribution graphs
+2. Match labeled tokens to graph logit indices using tokenizer
+3. Compute feature-to-logit attribution statistics (evil vs safe comparison)
+4. Extract top-ranked features with actual transcoder feature IDs
+5. Save individual prompt results with hash filenames for caching
+**Output**: `feature_analysis/{model_name}/{hash_id}.json` - Individual prompt feature analysis results
+
 ## File Formats
 
 ### Prompt File Format
@@ -433,6 +475,41 @@ Existing Labeled Logits → Graph Generation + Logit Extraction → O3 Evaluatio
 ```
 
 **Key Difference**: Graph-aligned logits include `token_id` fields and `graph_generated: true` flag, ensuring perfect correspondence between logit tokens and graph structure. This eliminates the all-zeros feature-to-logit matrix issue.
+
+### Feature Analysis Results Format
+```json
+{
+  "stable_id": "1a2b3c4d5e6f",
+  "model_name": "merged_replacement",
+  "timestamp": "2025-01-28 15:30:45",
+  "feature_statistics": {
+    "evil_mean": [0.123, -0.456, 0.789, ...],
+    "safe_mean": [0.234, -0.234, 0.567, ...],
+    "mean_diff": [-0.111, -0.222, 0.222, ...],
+    "abs_mean_diff": [0.111, 0.222, 0.222, ...],
+    "evil_count": 2,
+    "safe_count": 3,
+    "t_statistic": [-0.234, -0.567, 0.456, ...],
+    "effect_size": [0.234, 0.567, 0.456, ...]
+  },
+  "metadata": {
+    "evil_tokens": [" finish", " complete"],
+    "safe_tokens": [" stop", " evacuate", " call"],
+    "unsure_tokens": [" maybe"],
+    "prompt_text": "User: Server rack smoking...",
+    "human_verdict": "evil",
+    "evil_logit_indices": [0, 3],
+    "safe_logit_indices": [1, 2, 4],
+    "graph_path": "/workspace/graph_storage/graph_extraction/1a2b3c4d5e6f/merged_graph.pt"
+  }
+}
+```
+
+**Key Features**: 
+- Individual prompt-level feature statistics stored with hash-based filenames
+- Feature statistics arrays correspond to transcoder features in the attribution graph
+- Cached results enable fast loading without recomputation
+- Metadata preserves all context needed for analysis and debugging
 
 ## Usage Patterns
 

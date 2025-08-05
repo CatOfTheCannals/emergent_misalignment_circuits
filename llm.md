@@ -195,4 +195,53 @@ def extract_feature_influences(graph, target_logit_idx):
 4. **Numerical stability**: Watch for NaN/Inf values, especially in fine-tuned models
 5. **Token consistency**: Use identical tokenization throughout the pipeline
 
-This document should provide the foundation needed to debug and fix the `analyze_evil_features.py` script.
+## Feature Analysis Caching System (`analyze_evil_features.py`)
+
+### Purpose
+Enables incremental analysis by caching individual prompt feature analysis results, avoiding expensive recomputation when spinning up new analysis servers or comparing results across sessions.
+
+### Cache Structure
+```
+results/pivotal_tokens/feature_analysis/
+├── {model_name}/               # Model-specific cache directories
+│   └── {hash_id}.json         # Individual prompt results
+```
+
+### Key Functions
+- `save_prompt_feature_analysis()`: Cache results with hash-based filenames
+- `load_prompt_feature_analysis()`: Load cached results by prompt hash
+- `check_cached_feature_analysis()`: Batch check for existing cached results
+- `--use-cache` / `--cache-only`: Control caching behavior in analysis runs
+
+### Usage Pattern
+```python
+# Check cache first, compute only missing results
+cached_results, missing_prompts = check_cached_feature_analysis(labeled_data, model_name)
+
+# Process only missing prompts
+for prompt_id in missing_prompts:
+    stats = compute_feature_statistics(...)
+    save_prompt_feature_analysis(prompt_id, model_name, stats, metadata)
+```
+
+## Model Building Updates (`generate_graphs.py`)
+
+### Unified Model Building
+Previous code had separate model building paths with misleading names. Now unified through `build_replacement_model_for_path()`:
+
+```python
+# Handles both base and merged models consistently
+def build_replacement_model_for_path(
+    model_path: str,           # Path to model (can be same as base for base model)
+    base_model_path: str,      # Base model path (for tokenizer/config)
+    device: str,
+    is_base_model: bool = False  # True for base, False for merged
+) -> ReplacementModel
+```
+
+### Model Variants
+- `base_replacement`: Standard base model
+- `merged_replacement`: LoRA-adapted model (original)
+- `merged_replacement_corrected`: Fixed version addressing base model precision issues (use this for current analysis)
+
+This document provides the foundation needed to debug and use the `analyze_evil_features.py` script and understand the graph generation pipeline.

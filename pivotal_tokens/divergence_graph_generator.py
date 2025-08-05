@@ -18,6 +18,8 @@ from pathlib import Path
 import logging
 from typing import List, Dict, Optional
 
+# Configure logging for this module
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class DivergenceGraphGenerator:
@@ -39,8 +41,11 @@ class DivergenceGraphGenerator:
     
     def prepare_divergence_prompts(self) -> List[Dict]:
         """Get evil divergence prompts and prepare them for graph generation."""
-        divergence_prompt_ids = self.analyzer.get_evil_divergence_prompts()
-        logger.info(f"Found {len(divergence_prompt_ids)} evil divergence prompts")
+        # Use the correct model_id for divergence detection
+        custom_model_id = self.model_id if self.model_id != "merged_replacement" else None
+        divergence_prompt_ids = self.analyzer.get_evil_divergence_prompts(custom_model_id)
+        
+        logger.info(f"Found {len(divergence_prompt_ids)} evil divergence prompts for model_id: {self.model_id}")
         
         # Get prompt text from labeled files
         base_data = self.analyzer.get_model_data('base')
@@ -48,14 +53,10 @@ class DivergenceGraphGenerator:
         if self.model_id == "merged_replacement":
             merged_data = self.analyzer.get_model_data('adapted')
         else:
-            # For custom model_ids like "merged_replacement_corrected", load directly
-            model_dir = self.analyzer.labeled_logits_dir / self.model_id
-            merged_data = {}
-            if model_dir.exists():
-                for file_path in model_dir.glob("*.json"):
-                    analysis, status = self.analyzer.analyze_labeled_file(file_path)
-                    if analysis:
-                        merged_data[analysis['prompt_id']] = analysis
+            # For custom model_ids, use the new get_model_data_by_id method
+            merged_data = self.analyzer.get_model_data_by_id(self.model_id)
+        
+        logger.info(f"Base data: {len(base_data)} prompts, Merged data ({self.model_id}): {len(merged_data)} prompts")
         
         prompts_for_generation = []
         for prompt_id in divergence_prompt_ids:
@@ -63,8 +64,10 @@ class DivergenceGraphGenerator:
             prompt_text = None
             if prompt_id in merged_data:
                 prompt_text = merged_data[prompt_id]['prompt_text']
+                logger.info(f"Found prompt text for {prompt_id} in {self.model_id} data")
             elif prompt_id in base_data:
                 prompt_text = base_data[prompt_id]['prompt_text']
+                logger.info(f"Found prompt text for {prompt_id} in base data")
             
             if prompt_text:
                 prompt_data = {
@@ -78,6 +81,7 @@ class DivergenceGraphGenerator:
             else:
                 logger.warning(f"Could not find prompt text for divergence prompt {prompt_id}")
         
+        logger.info(f"Successfully prepared {len(prompts_for_generation)} prompts for graph generation")
         return prompts_for_generation
     
     def generate_base_replacement_divergence_graphs(self, override: bool = False) -> bool:
@@ -146,9 +150,11 @@ class DivergenceGraphGenerator:
         logger.info("GENERATING EVIL DIVERGENCE GRAPHS")
         logger.info("="*60)
         logger.info(f"Storage directory: {self.graph_storage_dir}")
+        logger.info(f"Target model_id: {self.model_id}")
         
-        # Show summary first
-        summary = self.analyzer.print_summary()
+        # Show summary first using the correct model_id for comparison
+        custom_model_id = self.model_id if self.model_id != "merged_replacement" else None
+        summary = self.analyzer.print_summary(custom_model_id)
         divergence_count = summary.get('evil_divergence_count', 0)
         logger.info(f"Generating graphs for {divergence_count} evil divergence prompts")
         
@@ -175,24 +181,22 @@ class DivergenceGraphGenerator:
     
     def get_divergence_info(self) -> Dict:
         """Get information about evil divergence prompts."""
-        divergence_prompts = self.analyzer.get_evil_divergence_prompts()
+        # Use the correct model_id for divergence detection
+        custom_model_id = self.model_id if self.model_id != "merged_replacement" else None
+        divergence_prompts = self.analyzer.get_evil_divergence_prompts(custom_model_id)
+        
         # Use the specific model_id for merged model data
         if self.model_id == "merged_replacement":
             merged_data = self.analyzer.get_model_data('adapted')
         else:
-            # For custom model_ids, load directly
-            model_dir = self.analyzer.labeled_logits_dir / self.model_id
-            merged_data = {}
-            if model_dir.exists():
-                for file_path in model_dir.glob("*.json"):
-                    analysis, status = self.analyzer.analyze_labeled_file(file_path)
-                    if analysis:
-                        merged_data[analysis['prompt_id']] = analysis
+            # For custom model_ids, use the new get_model_data_by_id method
+            merged_data = self.analyzer.get_model_data_by_id(self.model_id)
         
         info = {
             'count': len(divergence_prompts),
             'prompt_ids': divergence_prompts,
-            'examples': []
+            'examples': [],
+            'model_id': self.model_id
         }
         
         # Get examples with evil tokens

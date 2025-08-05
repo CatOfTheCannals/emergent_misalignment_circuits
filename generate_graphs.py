@@ -255,40 +255,300 @@ def load_merged_model(model_path: str, device: str) -> AutoModelForCausalLM:
     )
 
 
-def build_replacement_model(model_name: str, model_path: str, base_model_path: str, device: str) -> ReplacementModel:
-    """Build a ReplacementModel for the given model configuration."""
+def build_replacement_model_for_path(
+    model_path: str, 
+    base_model_path: str, 
+    device: str,
+    is_base_model: bool = False
+) -> ReplacementModel:
+    """Build a ReplacementModel for any model path.
+    
+    Args:
+        model_path: Path to the model to load (can be same as base_model_path for base model)
+        base_model_path: Path to the base model (used for tokenizer/config)
+        device: Device to load model on
+        is_base_model: If True, build base model; if False, build merged model
+    """
     device_obj = torch.device(device)
     
-    # Load the merged HF model (no adapter logic)
-    merged_hf_model = load_merged_model(model_path, device)
-    
-    # Load transcoders
-    transcoders, feature_input_hook, feature_output_hook, scan = load_transcoder_set(
-        "llama", device=device_obj, dtype=torch.bfloat16
-    )
-    
-    return ReplacementModel.from_pretrained_and_transcoders(
-        model_name=base_model_path,
-        transcoders=transcoders,
-        feature_input_hook=feature_input_hook,
-        feature_output_hook=feature_output_hook,
-        scan=scan,
-        hf_model=merged_hf_model,
-        device=device_obj,
-        dtype=torch.bfloat16
-    )
+    if is_base_model:
+        # Base model: use ReplacementModel.from_pretrained
+        return ReplacementModel.from_pretrained(
+            base_model_path,
+            "llama",  # transcoder_set
+            device=device_obj,
+            dtype=torch.bfloat16
+        )
+    else:
+        # Merged model: load HF model and transcoders separately
+        merged_hf_model = load_merged_model(model_path, device)
+        
+        # Load transcoders
+        transcoders, feature_input_hook, feature_output_hook, scan = load_transcoder_set(
+            "llama", device=device_obj, dtype=torch.bfloat16
+        )
+        
+        return ReplacementModel.from_pretrained_and_transcoders(
+            model_name=base_model_path,
+            transcoders=transcoders,
+            feature_input_hook=feature_input_hook,
+            feature_output_hook=feature_output_hook,
+            scan=scan,
+            hf_model=merged_hf_model,
+            device=device_obj,
+            dtype=torch.bfloat16
+        )
+
+
+def build_replacement_model(model_name: str, model_path: str, base_model_path: str, device: str) -> ReplacementModel:
+    """Build a ReplacementModel for the given model configuration. (Legacy wrapper)"""
+    return build_replacement_model_for_path(model_path, base_model_path, device, is_base_model=False)
 
 
 def build_base_replacement_model(base_model_path: str, device: str) -> ReplacementModel:
-    """Build a ReplacementModel for the base model."""
-    device_obj = torch.device(device)
+    """Build a ReplacementModel for the base model. (Legacy wrapper)"""
+    return build_replacement_model_for_path(base_model_path, base_model_path, device, is_base_model=True)
+
+
+def generate_single_model_graph(
+    model_name: str,
+    model_path: str,
+    base_model_path: str,
+    prompt_text: str,
+    prompt_name: str,
+    results_dir: Path,
+    device: str = "cuda",
+    max_n_logits: int = 10,
+    desired_logit_prob: float = 0.95,
+    max_feature_nodes: int = 8192,
+    batch_size: int = 256,
+    node_threshold: float = 0.1,
+    edge_threshold: float = 0.01,
+    offload: bool = True,
+    verbose: bool = False,
+    save_logits: bool = True,
+    override: bool = False
+) -> Dict:
+    """Generate attribution graph for a single model and organize outputs by model_name.
     
-    return ReplacementModel.from_pretrained(
-        base_model_path,
-        "llama",  # transcoder_set
-        device=device_obj,
-        dtype=torch.bfloat16
+    Args:
+        model_name: Name/ID of the model (used for directory organization)
+        model_path: Path to the model to load
+        base_model_path: Path to the base model (for tokenizer/config)
+        prompt_text: The prompt to analyze
+        prompt_name: Unique identifier for this prompt
+        results_dir: Base directory for storing results
+        device: Device to load model on
+        save_logits: Whether to extract and save logits
+        override: Whether to regenerate existing graphs
+        
+    Returns:
+        Dict with metadata about generated artifacts
+    """
+    # Determine if this is a base model
+    is_base_model = model_name == "base_replacement"
+    
+    # Create model-specific directory structure
+    model_dir = results_dir / model_name / prompt_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Define output paths
+    graph_path = model_dir / "graph.pt"
+    logits_path = model_dir / "logits.json" if save_logits else None
+    graph_files_dir = model_dir / "graph_files"
+    
+    # Skip generation if graph already exists (unless override is True)
+    if not override and graph_path.exists():
+        print(f"  Graph already exists for {model_name}:{prompt_name}; skipping (use --override to regenerate).")
+        return {
+            'model_name': model_name,
+            'prompt_name': prompt_name, 
+            'graph_path': graph_path,
+            'logits_path': logits_path,
+            'graph_files_dir': graph_files_dir,
+            'skipped': True
+        }
+    
+    # Build the model
+    print(f"  Building {model_name} model...")
+    model = build_replacement_model_for_path(
+        model_path, base_model_path, device, is_base_model
     )
+    
+    # Generate attribution graph
+    print(f"  Generating {model_name} graph...")
+    graph = attribute(
+        prompt=prompt_text,
+        model=model,
+        max_n_logits=max_n_logits,
+        desired_logit_prob=desired_logit_prob,
+        batch_size=batch_size,
+        max_feature_nodes=max_feature_nodes,
+        offload=offload,
+        verbose=verbose,
+    )
+    
+    # Save graph
+    graph.to_pt(str(graph_path))
+    print(f"  ✓ Graph saved: {graph_path}")
+    
+    # Extract and save logits if requested
+    if save_logits:
+        print(f"  Extracting logits for {model_name}...")
+        hash_id = prompt_hash_id(prompt_text)
+        
+        _, top_k_tokens, _ = extract_logits_from_replacement_model(
+            model, prompt_text, top_k=10
+        )
+        
+        logits_data = {
+            "prompt_id": hash_id,
+            "prompt_text": prompt_text,
+            "tested_model": model_name,
+            "format": "generated_graph",
+            "top_k": top_k_tokens,
+            "hash_id": hash_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "graph_generated": True
+        }
+        
+        save_logits_data(logits_data, logits_path)
+        print(f"  ✓ Logits saved: {logits_path}")
+    
+    # Create graph files for serving
+    print(f"  Creating graph files for {model_name}...")
+    create_graph_files(
+        graph_or_path=graph_path,
+        slug=f"{model_name}-{prompt_name}",
+        output_path=str(graph_files_dir),
+        node_threshold=node_threshold,
+        edge_threshold=edge_threshold
+    )
+    print(f"  ✓ Graph files created: {graph_files_dir}")
+    
+    return {
+        'model_name': model_name,
+        'prompt_name': prompt_name,
+        'graph_path': graph_path,
+        'logits_path': logits_path, 
+        'graph_files_dir': graph_files_dir,
+        'skipped': False
+    }
+
+
+def generate_single_model_graph_with_model(
+    model,
+    model_name: str,
+    prompt_text: str,
+    prompt_name: str,
+    results_dir: Path,
+    max_n_logits: int = 10,
+    desired_logit_prob: float = 0.95,
+    max_feature_nodes: int = 8192,
+    batch_size: int = 256,
+    node_threshold: float = 0.1,
+    edge_threshold: float = 0.01,
+    offload: bool = True,
+    verbose: bool = False,
+    save_logits: bool = True,
+    override: bool = False
+) -> Dict:
+    """Generate attribution graph using a pre-built model (memory efficient for batch processing).
+    
+    This version accepts a pre-built model to avoid repeated model loading and CUDA OOM issues.
+    
+    Args:
+        model: Pre-built ReplacementModel instance
+        model_name: Name/ID of the model (used for directory organization)
+        prompt_text: The prompt to analyze
+        prompt_name: Unique identifier for this prompt
+        results_dir: Base directory for storing results
+        save_logits: Whether to extract and save logits
+        override: Whether to regenerate existing graphs
+        
+    Returns:
+        Dict with metadata about generated artifacts
+    """
+    # Create model-specific directory structure
+    model_dir = results_dir / model_name / prompt_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Define output paths
+    graph_path = model_dir / "graph.pt"
+    logits_path = model_dir / "logits.json" if save_logits else None
+    graph_files_dir = model_dir / "graph_files"
+    
+    # Skip generation if graph already exists (unless override is True)
+    if not override and graph_path.exists():
+        print(f"  Graph already exists for {model_name}:{prompt_name}; skipping (use --override to regenerate).")
+        return {
+            'model_name': model_name,
+            'prompt_name': prompt_name, 
+            'graph_path': graph_path,
+            'logits_path': logits_path,
+            'graph_files_dir': graph_files_dir,
+            'skipped': True
+        }
+    
+    # Generate attribution graph using pre-built model
+    print(f"  Generating {model_name} graph...")
+    graph = attribute(
+        prompt=prompt_text,
+        model=model,
+        max_n_logits=max_n_logits,
+        desired_logit_prob=desired_logit_prob,
+        batch_size=batch_size,
+        max_feature_nodes=max_feature_nodes,
+        offload=offload,
+        verbose=verbose,
+    )
+    
+    # Save graph
+    graph.to_pt(str(graph_path))
+    print(f"  ✓ Graph saved: {graph_path}")
+    
+    # Extract and save logits if requested
+    if save_logits:
+        print(f"  Extracting logits for {model_name}...")
+        hash_id = prompt_hash_id(prompt_text)
+        
+        _, top_k_tokens, _ = extract_logits_from_replacement_model(
+            model, prompt_text, top_k=10
+        )
+        
+        logits_data = {
+            "prompt_id": hash_id,
+            "prompt_text": prompt_text,
+            "tested_model": model_name,
+            "format": "generated_graph",
+            "top_k": top_k_tokens,
+            "hash_id": hash_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "graph_generated": True
+        }
+        
+        save_logits_data(logits_data, logits_path)
+        print(f"  ✓ Logits saved: {logits_path}")
+    
+    # Create graph files for serving
+    print(f"  Creating graph files for {model_name}...")
+    create_graph_files(
+        graph_or_path=graph_path,
+        slug=f"{model_name}-{prompt_name}",
+        output_path=str(graph_files_dir),
+        node_threshold=node_threshold,
+        edge_threshold=edge_threshold
+    )
+    print(f"  ✓ Graph files created: {graph_files_dir}")
+    
+    return {
+        'model_name': model_name,
+        'prompt_name': prompt_name,
+        'graph_path': graph_path,
+        'logits_path': logits_path, 
+        'graph_files_dir': graph_files_dir,
+        'skipped': False
+    }
 
 
 def generate_graphs(
@@ -311,24 +571,36 @@ def generate_graphs(
     override: bool = False,
     save_logits: bool = True,
 ) -> List:
-    """Generate graphs for the given model and prompts, including base model comparison.
+    """Generate graphs for a single model and organize outputs by model_name.
+    
+    This function now follows the single responsibility principle:
+    - Only processes ONE model per call
+    - Organizes outputs under results_dir/model_name/
+    - Creates graph_files for serving compatibility
+    - Builds model ONCE and reuses across all prompts for memory efficiency
     
     Args:
+        model_name: Name/ID of the model (used for directory organization)
+        model_path: Path to the model to load
+        base_model_path: Path to the base model (for tokenizer/config)
+        prompts: List of prompt data dictionaries
+        results_dir: Base directory for storing results
         save_logits: If True, extract and save logits alongside graph generation
+        serve_graphs: If True, start graph servers for visualization
     """
+    print(f"Generating graphs for model: {model_name}")
     
-    # Create results directory structure
-    model_dir = results_dir / model_name
-    model_dir.mkdir(parents=True, exist_ok=True)
+    # Determine if this is a base model
+    is_base_model = model_name == "base_replacement"
     
-    # Build both models
-    print("Building base model...")
-    base_replacement_model = build_base_replacement_model(base_model_path, device)
-    
-    print("Building merged model...")
-    merged_replacement_model = build_replacement_model(model_name, model_path, base_model_path, device)
+    # Build model ONCE for all prompts (memory efficient)
+    print(f"Building {model_name} model...")
+    model = build_replacement_model_for_path(
+        model_path, base_model_path, device, is_base_model
+    )
     
     servers = []
+    all_results = []
     
     for i, prompt_data in enumerate(prompts):
         prompt_name = prompt_data['stable_id']
@@ -336,143 +608,44 @@ def generate_graphs(
         
         print(f"Generating graphs for prompt: {prompt_name}")
         
-        # Create prompt-specific directory
-        prompt_dir = model_dir / prompt_name
-        prompt_dir.mkdir(exist_ok=True)
-        
-        # ------------------------------------------------------------------
-        # Skip generation if graphs already exist (unless override is True)
-        # ------------------------------------------------------------------
-        base_graph_path = prompt_dir / "base_graph.pt"
-        merged_graph_path = prompt_dir / "merged_graph.pt"
-
-        if not override and base_graph_path.exists() and merged_graph_path.exists():
-            print(f"  Graphs already exist for prompt '{prompt_name}'; skipping (use --override to regenerate).")
-            # Still ensure combined graph files directory exists so server can run
-            combined_graph_files_dir = prompt_dir / "graph_files"
-            if serve_graphs and combined_graph_files_dir.exists():
-                port = start_port + i
-                try:
-                    server = serve(data_dir=str(combined_graph_files_dir), port=port)
-                    servers.append(server)
-                    print(f"  Serving existing graphs on port {port}")
-                except OSError as e:
-                    print(f"  Failed to start server on port {port}: {e}")
-            continue
-
-        # Generate base model graph
-        print(f"  Generating base model graph...")
-        base_graph = attribute(
-            prompt=prompt_text,
-            model=base_replacement_model,
+        # Generate graph using pre-built model (memory efficient)
+        result = generate_single_model_graph_with_model(
+            model=model,  # Reuse same model instance
+            model_name=model_name,
+            prompt_text=prompt_text,
+            prompt_name=prompt_name,
+            results_dir=results_dir,
             max_n_logits=max_n_logits,
             desired_logit_prob=desired_logit_prob,
-            batch_size=batch_size,
             max_feature_nodes=max_feature_nodes,
+            batch_size=batch_size,
+            node_threshold=node_threshold,
+            edge_threshold=edge_threshold,
             offload=offload,
             verbose=verbose,
+            save_logits=save_logits,
+            override=override
         )
         
-        # Save base graph
-        base_graph.to_pt(base_graph_path)
+        all_results.append(result)
         
-        # Generate merged model graph
-        print(f"  Generating merged model graph...")
-        merged_graph = attribute(
-            prompt=prompt_text,
-            model=merged_replacement_model,
-            max_n_logits=max_n_logits,
-            desired_logit_prob=desired_logit_prob,
-            batch_size=batch_size,
-            max_feature_nodes=max_feature_nodes,
-            offload=offload,
-            verbose=verbose,
-        )
-        
-        # Save merged graph
-        merged_graph.to_pt(merged_graph_path)
-        
-        # ------------------------------------------------------------------
-        # Extract and save logits if requested
-        # ------------------------------------------------------------------
-        if save_logits:
-            print(f"  Extracting logits for base and merged models...")
-            hash_id = prompt_hash_id(prompt_text)
-            
-            # Extract base model logits
-            _, base_top_k_tokens, _ = extract_logits_from_replacement_model(
-                base_replacement_model, prompt_text, top_k=10
-            )
-            
-            # Save base model logits
-            base_logits_data = {
-                "prompt_id": hash_id,
-                "prompt_text": prompt_text,
-                "tested_model": "base_replacement",
-                "format": "generated_graph",
-                "top_k": base_top_k_tokens,
-                "hash_id": hash_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "graph_generated": True
-            }
-            base_logits_path = prompt_dir / "base_logits.json"
-            save_logits_data(base_logits_data, base_logits_path)
-            
-            # Extract merged model logits
-            _, merged_top_k_tokens, _ = extract_logits_from_replacement_model(
-                merged_replacement_model, prompt_text, top_k=10
-            )
-            
-            # Save merged model logits
-            merged_logits_data = {
-                "prompt_id": hash_id,
-                "prompt_text": prompt_text,
-                "tested_model": "merged_replacement",
-                "format": "generated_graph", 
-                "top_k": merged_top_k_tokens,
-                "hash_id": hash_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "graph_generated": True
-            }
-            merged_logits_path = prompt_dir / "merged_logits.json"
-            save_logits_data(merged_logits_data, merged_logits_path)
-            
-            print(f"  ✓ Base logits saved: {base_logits_path}")
-            print(f"  ✓ Merged logits saved: {merged_logits_path}")
-        
-        # Create combined graph files directory for both models
-        combined_graph_files_dir = prompt_dir / "graph_files"
-        
-        # Create graph files for base model
-        create_graph_files(
-            graph_or_path=base_graph_path,
-            slug=f"{model_name}-{prompt_name}-base",
-            output_path=str(combined_graph_files_dir),
-            node_threshold=node_threshold,
-            edge_threshold=edge_threshold
-        )
-        
-        # Create graph files for merged model
-        create_graph_files(
-            graph_or_path=merged_graph_path,
-            slug=f"{model_name}-{prompt_name}-merged",
-            output_path=str(combined_graph_files_dir),
-            node_threshold=node_threshold,
-            edge_threshold=edge_threshold
-        )
-        
-        # Serve combined graphs if requested
-        if serve_graphs:
+        # Serve graphs if requested and not skipped
+        if serve_graphs and not result['skipped']:
             port = start_port + i
-            
             try:
-                server = serve(data_dir=str(combined_graph_files_dir), port=port)
+                server = serve(data_dir=str(result['graph_files_dir']), port=port)
                 servers.append(server)
-                print(f"  Graph server started on port {port} for {prompt_name}")
-                print(f"    - Base model: {model_name}-{prompt_name}-base")
-                print(f"    - Merged model: {model_name}-{prompt_name}-merged")
+                print(f"  Graph server started on port {port} for {model_name}:{prompt_name}")
             except OSError as e:
                 print(f"  Failed to start server on port {port}: {e}")
+    
+    print(f"Completed graph generation for {model_name}: {len([r for r in all_results if not r['skipped']])} new graphs, {len([r for r in all_results if r['skipped']])} skipped")
+    
+    # Clean up model to free CUDA memory after all prompts are processed
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
     
     return servers
 

@@ -109,15 +109,22 @@ class HumanLabelsAnalyzer:
         
         return results
     
-    def get_evil_divergence_prompts(self) -> List[str]:
+    def get_evil_divergence_prompts(self, custom_adapted_model_id: Optional[str] = None) -> List[str]:
         """
         Get prompts where adapted model has evil tokens but base model doesn't.
+        
+        Args:
+            custom_adapted_model_id: Optional custom model directory name to use instead of 'merged_replacement'
         
         Returns:
             List of prompt IDs showing emergent misalignment
         """
         base_data = self.get_model_data('base')
-        adapted_data = self.get_model_data('adapted')
+        
+        if custom_adapted_model_id:
+            adapted_data = self.get_model_data_by_id(custom_adapted_model_id)
+        else:
+            adapted_data = self.get_model_data('adapted')
         
         divergence_prompts = []
         common_prompts = set(base_data.keys()) & set(adapted_data.keys())
@@ -148,6 +155,31 @@ class HumanLabelsAnalyzer:
         else:
             raise ValueError(f"Unknown model_type: {model_type}. Use 'base' or 'adapted'")
         
+        return self._load_model_directory(model_dir)
+    
+    def get_model_data_by_id(self, model_id: str) -> Dict[str, Dict]:
+        """
+        Get all human-labeled data for a model by its directory name.
+        
+        Args:
+            model_id: Directory name under labeled_logits (e.g., 'merged_replacement_corrected')
+            
+        Returns:
+            Dict mapping prompt_id to analysis data
+        """
+        model_dir = self.labeled_logits_dir / model_id
+        return self._load_model_directory(model_dir)
+    
+    def _load_model_directory(self, model_dir: Path) -> Dict[str, Dict]:
+        """
+        Helper method to load all labeled files from a model directory.
+        
+        Args:
+            model_dir: Path to the model directory
+            
+        Returns:
+            Dict mapping prompt_id to analysis data
+        """
         results = {}
         if model_dir.exists():
             for file_path in model_dir.glob("*.json"):
@@ -172,15 +204,27 @@ class HumanLabelsAnalyzer:
         
         return all_evil_prompts
     
-    def print_summary(self) -> Dict:
-        """Print and return summary statistics."""
-        base_data = self.get_model_data('base')
-        adapted_data = self.get_model_data('adapted')
-        evil_labels = self.get_all_human_evil_labels()
-        divergence_prompts = self.get_evil_divergence_prompts()
+    def print_summary(self, custom_adapted_model_id: Optional[str] = None) -> Dict:
+        """Print and return summary statistics.
         
-        base_evil_count = len(evil_labels['base_model'])
-        adapted_evil_count = len(evil_labels['adapted_model'])
+        Args:
+            custom_adapted_model_id: Optional custom model directory name to use for comparison
+        """
+        base_data = self.get_model_data('base')
+        
+        if custom_adapted_model_id:
+            adapted_data = self.get_model_data_by_id(custom_adapted_model_id)
+            adapted_model_name = custom_adapted_model_id
+        else:
+            adapted_data = self.get_model_data('adapted')
+            adapted_model_name = "merged_replacement"
+        
+        evil_labels = self.get_all_human_evil_labels()
+        divergence_prompts = self.get_evil_divergence_prompts(custom_adapted_model_id)
+        
+        # Count evil tokens for current comparison
+        base_evil_count = sum(1 for data in base_data.values() if data['has_evil_tokens'])
+        adapted_evil_count = sum(1 for data in adapted_data.values() if data['has_evil_tokens'])
         common_prompts = set(base_data.keys()) & set(adapted_data.keys())
         all_evil_prompts = self.get_all_evil_prompt_ids()
         
@@ -191,14 +235,15 @@ class HumanLabelsAnalyzer:
             'adapted_evil_count': adapted_evil_count,
             'common_prompts': len(common_prompts),
             'evil_divergence_count': len(divergence_prompts),
-            'total_unique_evil_prompts': len(all_evil_prompts)
+            'total_unique_evil_prompts': len(all_evil_prompts),
+            'adapted_model_name': adapted_model_name
         }
         
         print("="*60)
         print("HUMAN LABELS ANALYSIS SUMMARY")
         print("="*60)
-        print(f"Total base model labeled: {summary['total_base_labeled']}")
-        print(f"Total adapted model labeled: {summary['total_adapted_labeled']}")
+        print(f"Base model: base_replacement ({summary['total_base_labeled']} labeled)")
+        print(f"Adapted model: {adapted_model_name} ({summary['total_adapted_labeled']} labeled)")
         print(f"Base model files with evil tokens: {summary['base_evil_count']}")
         print(f"Adapted model files with evil tokens: {summary['adapted_evil_count']}")  
         print(f"Common prompts: {summary['common_prompts']}")

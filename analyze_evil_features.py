@@ -10,6 +10,7 @@ import argparse
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 import torch
@@ -59,6 +60,89 @@ def save_json_file(file_path: Path, data: Dict):
     file_path.parent.mkdir(parents=True, exist_ok=True)
     with open(file_path, 'w') as f:
         json.dump(data, f, indent=2)
+
+
+def get_feature_analysis_dir(model_name: str, base_dir: Path = None) -> Path:
+    """Get the directory for storing individual prompt feature analysis results."""
+    if base_dir is None:
+        base_dir = Path("results/pivotal_tokens")
+    
+    model_safe_name = model_name.replace('/', '_').replace(' ', '_')
+    feature_analysis_dir = base_dir / "feature_analysis" / model_safe_name
+    feature_analysis_dir.mkdir(parents=True, exist_ok=True)
+    return feature_analysis_dir
+
+
+def save_prompt_feature_analysis(
+    stable_id: str, 
+    model_name: str, 
+    feature_stats: Dict, 
+    prompt_metadata: Dict,
+    base_dir: Path = None
+) -> Path:
+    """Save individual prompt feature analysis results with hash filename."""
+    feature_analysis_dir = get_feature_analysis_dir(model_name, base_dir)
+    result_file = feature_analysis_dir / f"{stable_id}.json"
+    
+    # Convert tensors to lists for JSON serialization
+    serializable_stats = {}
+    for key, value in feature_stats.items():
+        if isinstance(value, torch.Tensor):
+            serializable_stats[key] = value.cpu().tolist()
+        else:
+            serializable_stats[key] = value
+    
+    result_data = {
+        'stable_id': stable_id,
+        'model_name': model_name,
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'feature_statistics': serializable_stats,
+        'metadata': prompt_metadata
+    }
+    
+    save_json_file(result_file, result_data)
+    logger.info(f"Saved feature analysis for {stable_id} to {result_file}")
+    return result_file
+
+
+def load_prompt_feature_analysis(
+    stable_id: str, 
+    model_name: str, 
+    base_dir: Path = None
+) -> Optional[Dict]:
+    """Load cached individual prompt feature analysis results."""
+    feature_analysis_dir = get_feature_analysis_dir(model_name, base_dir)
+    result_file = feature_analysis_dir / f"{stable_id}.json"
+    
+    if not result_file.exists():
+        return None
+    
+    try:
+        return load_json_file(result_file)
+    except Exception as e:
+        logger.warning(f"Error loading cached feature analysis for {stable_id}: {e}")
+        return None
+
+
+def check_cached_feature_analysis(
+    labeled_data: Dict[str, Dict], 
+    model_name: str,
+    base_dir: Path = None
+) -> Tuple[Dict[str, Dict], List[str]]:
+    """Check which prompts have cached feature analysis results."""
+    cached_results = {}
+    missing_prompts = []
+    
+    for stable_id in labeled_data.keys():
+        cached_result = load_prompt_feature_analysis(stable_id, model_name, base_dir)
+        if cached_result:
+            cached_results[stable_id] = cached_result
+            logger.info(f"Found cached feature analysis for {stable_id}")
+        else:
+            missing_prompts.append(stable_id)
+    
+    logger.info(f"Found {len(cached_results)} cached results, {len(missing_prompts)} prompts need analysis")
+    return cached_results, missing_prompts
 
 
 def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, Dict]:
@@ -480,7 +564,9 @@ def analyze_single_model(
     top_k_features: int = 50,
     base_model_path: str = "meta-llama/Llama-3.2-1B-Instruct",
     adapted_model_path: str = None,
-    debug_prompt: str = None
+    debug_prompt: str = None,
+    use_cache: bool = True,
+    base_dir: Path = None
 ) -> Dict:
     """Analyze a single model and save results to avoid memory buildup."""
     
@@ -488,15 +574,34 @@ def analyze_single_model(
     start_time = time.time()
     logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Starting analysis for model: {model_display_name}")
     
+    # Check for cached results if enabled
+    cached_results = {}
+    prompts_to_process = labeled_data.copy()
+    
+    if use_cache:
+        logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Checking for cached feature analysis results...")
+        cached_results, missing_prompt_ids = check_cached_feature_analysis(
+            labeled_data, 
+            model_display_name, 
+            base_dir
+        )
+        
+        if cached_results:
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Found {len(cached_results)} cached results, processing {len(missing_prompt_ids)} missing prompts")
+            # Filter to only process missing prompts
+            prompts_to_process = {pid: labeled_data[pid] for pid in missing_prompt_ids if pid in labeled_data}
+        else:
+            logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: No cached results found, processing all {len(labeled_data)} prompts")
+    
     # Accumulate statistics across all prompts
     accumulated_stats = defaultdict(list)
     prompt_results = {}
     
     processed_count = 0
-    total_prompts = len(labeled_data)
-    logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Processing {total_prompts} prompts")
+    total_prompts = len(prompts_to_process)
+    logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Processing {total_prompts} prompts (from {len(labeled_data)} total, {len(cached_results)} cached)")
     
-    for i, (stable_id, token_data) in enumerate(labeled_data.items()):
+    for i, (stable_id, token_data) in enumerate(prompts_to_process.items()):
         prompt_start_time = time.time()
         logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Processing prompt {i+1}/{total_prompts}: {stable_id}")
         
@@ -548,6 +653,30 @@ def analyze_single_model(
                     'has_comparison': 'mean_diff' in stats
                 }
                 
+                # Save individual prompt feature analysis results
+                prompt_metadata = {
+                    'evil_tokens': token_data['evil_tokens'],
+                    'safe_tokens': token_data['safe_tokens'],
+                    'unsure_tokens': token_data.get('unsure_tokens', []),
+                    'prompt_text': token_data.get('prompt_text', ''),
+                    'human_verdict': token_data.get('human_verdict'),
+                    'evil_logit_indices': evil_logit_indices,
+                    'safe_logit_indices': safe_logit_indices,
+                    'graph_path': str(graph_path)
+                }
+                
+                try:
+                    save_prompt_feature_analysis(
+                        stable_id, 
+                        model_display_name, 
+                        stats, 
+                        prompt_metadata,
+                        base_dir
+                    )
+                    logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Saved individual feature analysis for {stable_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to save individual feature analysis for {stable_id}: {e}")
+                
                 # Accumulate statistics
                 for key, tensor in stats.items():
                     if isinstance(tensor, torch.Tensor):
@@ -574,8 +703,32 @@ def analyze_single_model(
             logger.error(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Traceback: {traceback.format_exc()}")
             continue
     
+    # Integrate cached results into accumulated statistics
+    if cached_results:
+        logger.info(f"Integrating {len(cached_results)} cached results into accumulated statistics...")
+        for stable_id, cached_result in cached_results.items():
+            cached_stats = cached_result.get('feature_statistics', {})
+            
+            # Add cached results to prompt_results for summary
+            cached_metadata = cached_result.get('metadata', {})
+            prompt_results[stable_id] = {
+                'evil_count': len(cached_metadata.get('evil_logit_indices', [])),
+                'safe_count': len(cached_metadata.get('safe_logit_indices', [])),
+                'has_comparison': 'mean_diff' in cached_stats,
+                'from_cache': True
+            }
+            
+            # Convert cached stats back to tensors and add to accumulated_stats
+            for key, value in cached_stats.items():
+                if isinstance(value, list) and value:  # Non-empty list
+                    try:
+                        tensor_value = torch.tensor(value)
+                        accumulated_stats[key].append(tensor_value)
+                    except Exception as e:
+                        logger.warning(f"Failed to convert cached stat {key} for {stable_id}: {e}")
+    
     # Aggregate statistics across all prompts
-    logger.info("Aggregating statistics across prompts...")
+    logger.info(f"Aggregating statistics across {len(accumulated_stats)} stat types from {processed_count} newly processed + {len(cached_results)} cached prompts...")
     
     aggregated_stats = {}
     
@@ -808,6 +961,10 @@ def main():
                        help="Limit analysis to first N prompts (useful for testing)")
     parser.add_argument("--debug-prompt", type=str,
                        help="Debug specific prompt hash - print detailed loading info")
+    parser.add_argument("--no-cache", action="store_true",
+                       help="Disable caching - recompute all feature analysis results")
+    parser.add_argument("--cache-only", action="store_true", 
+                       help="Only use cached results - skip computation for missing prompts")
     
     args = parser.parse_args()
     
@@ -917,6 +1074,21 @@ def main():
             logger.info(f"Limiting analysis to first {args.sample_size} prompts (was {len(labeled_data)})")
             labeled_data = dict(list(labeled_data.items())[:args.sample_size])
         
+        # Handle cache-only mode
+        if args.cache_only:
+            logger.info("Cache-only mode: filtering to only prompts with cached results")
+            cached_results_check, missing_prompts = check_cached_feature_analysis(
+                labeled_data, 
+                actual_model_id, 
+                Path(args.labeled_logits_dir).parent
+            )
+            if cached_results_check:
+                labeled_data = {pid: labeled_data[pid] for pid in cached_results_check.keys() if pid in labeled_data}
+                logger.info(f"Cache-only mode: processing {len(labeled_data)} prompts with cached results (skipping {len(missing_prompts)} missing)")
+            else:
+                logger.warning("Cache-only mode: no cached results found, skipping this model")
+                continue
+        
         # Ensure graphs exist before analysis
         if args.generate_missing_graphs:
             logger.info(f"Ensuring graphs exist for model: {actual_model_id}")
@@ -932,9 +1104,12 @@ def main():
             )
         
         # Analyze this model (use actual_model_id for graph lookup)
+        use_cache = not args.no_cache  # Use cache unless explicitly disabled
         model_results = analyze_single_model(
             model_name, actual_model_id, labeled_data, graphs_dir, output_dir, 
-            args.top_k, args.base_model_path, model_path, args.debug_prompt
+            args.top_k, args.base_model_path, model_path, args.debug_prompt,
+            use_cache, 
+            Path(args.labeled_logits_dir).parent  # Use pivotal_tokens dir as base
         )
         
         results[model_display_name] = model_results
