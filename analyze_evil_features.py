@@ -100,14 +100,29 @@ def save_prompt_feature_analysis(
             if key == 'mean_diff' and value.numel() > 0:
                 # Sort by actual mean_diff value (descending: most evil-promoting first)
                 top_indices = torch.argsort(value, descending=True)[:10]
-                serializable_stats['top_mean_diff_features'] = [
-                    {
+                
+                # Get feature mapping if available
+                feature_mapping = feature_stats.get('feature_mapping', [])
+                
+                serializable_stats['top_mean_diff_features'] = []
+                for rank, idx in enumerate(top_indices):
+                    idx_int = int(idx)
+                    feature_info = {
                         "mean_diff": float(value[idx]),
-                        "original_index": int(idx), 
+                        "original_index": idx_int, 
                         "rank": rank + 1
-                    } 
-                    for rank, idx in enumerate(top_indices)
-                ]
+                    }
+                    
+                    # Add layer/position info if available
+                    if idx_int < len(feature_mapping):
+                        mapping = feature_mapping[idx_int]
+                        feature_info.update({
+                            "actual_feature_idx": mapping['actual_feature_idx'],
+                            "layer": mapping['layer'],
+                            "position": mapping['position']
+                        })
+                    
+                    serializable_stats['top_mean_diff_features'].append(feature_info)
         else:
             serializable_stats[key] = value
     
@@ -447,6 +462,18 @@ def compute_feature_statistics(graph: Graph, evil_logit_indices: List[int], safe
             stats['t_statistic'] = stats['mean_diff'] / pooled_se
             stats['effect_size'] = torch.abs(stats['t_statistic'])
     
+    # Add feature mapping information for later use
+    stats['feature_mapping'] = []
+    for i, selected_feature_global_idx in enumerate(graph.selected_features):
+        layer, pos, actual_feature_idx = graph.active_features[selected_feature_global_idx.item()].tolist()
+        stats['feature_mapping'].append({
+            'subset_idx': i,
+            'global_idx': selected_feature_global_idx.item(),
+            'actual_feature_idx': actual_feature_idx,
+            'layer': layer,
+            'position': pos
+        })
+    
     return stats
 
 
@@ -756,8 +783,8 @@ def analyze_single_model(
             
             # Convert cached stats back to tensors and add to accumulated_stats
             for key, value in cached_stats.items():
-                # Skip the top_mean_diff_features field - it's just for inspection
-                if key == 'top_mean_diff_features':
+                # Skip fields that are just for inspection/metadata
+                if key in ['top_mean_diff_features', 'feature_mapping']:
                     continue
                     
                 if isinstance(value, list) and value:  # Non-empty list
