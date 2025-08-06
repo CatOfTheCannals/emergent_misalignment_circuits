@@ -28,6 +28,9 @@ from generate_graphs import generate_graphs, load_prompts_from_dir
 from transformers import AutoTokenizer
 from circuit_tracer.frontend.utils import process_token
 
+# Import pivotal tokens utilities for divergence analysis
+from pivotal_tokens.human_labels import HumanLabelsAnalyzer
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -65,10 +68,12 @@ def save_json_file(file_path: Path, data: Dict):
 def get_feature_analysis_dir(model_name: str, base_dir: Path = None) -> Path:
     """Get the directory for storing individual prompt feature analysis results."""
     if base_dir is None:
-        base_dir = Path("results/pivotal_tokens")
+        # Use unified structure: emergent_misalignment_circuits/results/pivotal_tokens/feature_analysis/
+        base_dir = Path(__file__).parent / "results" / "pivotal_tokens" / "feature_analysis"
     
+    # Create model-specific subdirectory within the unified base
     model_safe_name = model_name.replace('/', '_').replace(' ', '_')
-    feature_analysis_dir = base_dir / "feature_analysis" / model_safe_name
+    feature_analysis_dir = base_dir / model_safe_name
     feature_analysis_dir.mkdir(parents=True, exist_ok=True)
     return feature_analysis_dir
 
@@ -84,11 +89,25 @@ def save_prompt_feature_analysis(
     feature_analysis_dir = get_feature_analysis_dir(model_name, base_dir)
     result_file = feature_analysis_dir / f"{stable_id}.json"
     
-    # Convert tensors to lists for JSON serialization
+    # Convert tensors to lists for JSON serialization (keep raw unsorted data)
     serializable_stats = {}
     for key, value in feature_stats.items():
         if isinstance(value, torch.Tensor):
+            # Store raw unsorted data for proper aggregation
             serializable_stats[key] = value.cpu().tolist()
+            
+            # Add top mean_diff features separately for inspection
+            if key == 'mean_diff' and value.numel() > 0:
+                # Sort by actual mean_diff value (descending: most evil-promoting first)
+                top_indices = torch.argsort(value, descending=True)[:10]
+                serializable_stats['top_mean_diff_features'] = [
+                    {
+                        "mean_diff": float(value[idx]),
+                        "original_index": int(idx), 
+                        "rank": rank + 1
+                    } 
+                    for rank, idx in enumerate(top_indices)
+                ]
         else:
             serializable_stats[key] = value
     
@@ -118,7 +137,9 @@ def load_prompt_feature_analysis(
         return None
     
     try:
-        return load_json_file(result_file)
+        data = load_json_file(result_file)
+        # Data is now stored as raw unsorted lists - no conversion needed
+        return data
     except Exception as e:
         logger.warning(f"Error loading cached feature analysis for {stable_id}: {e}")
         return None
@@ -211,6 +232,10 @@ def load_labeled_tokens(labeled_logits_dir: Path, model_name: str) -> Dict[str, 
 
 def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path, is_base_model: bool = False) -> Optional[Path]:
     """Find existing graph file for a given stable_id and model, ensuring correct graph type for model type."""
+    logger.info(f"🔍 DEBUG: Finding graph for prompt {stable_id}, model {model_name}")
+    logger.info(f"🔍 DEBUG: graphs_dir parameter = {graphs_dir}")
+    logger.info(f"🔍 DEBUG: graphs_dir exists = {graphs_dir.exists()}")
+    
     model_safe_name = model_name.replace('/', '_').replace(' ', '_')
     
     # Determine correct graph filename based on model type
@@ -229,18 +254,24 @@ def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path, is_ba
         logger.info(f"Using fallback graph selection for model: {model_name} -> {target_graph_file}")
     
     
-    # PRIORITY 2: Messy divergence generator structure (current reality)
+    # PRIORITY 1: New structure from divergence graph generator
+    # Look for: /workspace/graph_storage/{model_name}/{prompt_id}/graph.pt
+    new_structure_path = graphs_dir / model_name / stable_id / "graph.pt"
+    logger.info(f"🔍 DEBUG: Checking new structure path: {new_structure_path}")
+    if new_structure_path.exists():
+        logger.info(f"✅ Found graph in new structure: {new_structure_path}")
+        return new_structure_path
+    else:
+        logger.info(f"❌ New structure path does not exist: {new_structure_path}")
+    
+    # PRIORITY 2: Old structure for backward compatibility
     # Look in the CORRECT directory based on model type
     if model_name in ["base_replacement", "merged_replacement"]:
-        # For base_replacement, look ONLY in base_replacement directory
-        # For merged_replacement, look ONLY in merged_replacement directory
-        correct_dir = model_name  # "base_replacement" or "merged_replacement"
+        correct_dir = model_name
         search_path = graphs_dir / correct_dir / stable_id / target_graph_file
         if search_path.exists():
-            logger.info(f"Found CORRECT graph in correct directory: {search_path}")
+            logger.info(f"Found graph in old correct directory: {search_path}")
             return search_path
-        
-
     
     # PRIORITY 3: Legacy structure (may have logit alignment issues)
     prompt_dir = graphs_dir / model_safe_name / stable_id
@@ -255,7 +286,7 @@ def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path, is_ba
     if is_base_model:
         possible_files = ["base_graph.pt"]
     else:
-        possible_files = ["merged_graph.pt"]
+        possible_files = ["merged_graph.pt", "graph.pt"]  # Add graph.pt as fallback
     
     for filename in possible_files:
         graph_path = prompt_dir / filename
@@ -263,7 +294,12 @@ def find_matching_graph(stable_id: str, model_name: str, graphs_dir: Path, is_ba
             logger.warning(f"Found LEGACY graph with fallback: {graph_path}")
             return graph_path
     
+    # Enhanced error logging
     logger.error(f"No graph found for {stable_id} with model {model_name}")
+    logger.error(f"  Primary search path (NEW): {new_structure_path}")
+    logger.error(f"  Directory exists: {new_structure_path.parent.exists()}")
+    if new_structure_path.parent.exists():
+        logger.error(f"  Directory contents: {list(new_structure_path.parent.glob('*'))}")
     return None
 
 
@@ -583,7 +619,7 @@ def analyze_single_model(
         cached_results, missing_prompt_ids = check_cached_feature_analysis(
             labeled_data, 
             model_display_name, 
-            base_dir
+            output_dir
         )
         
         if cached_results:
@@ -671,7 +707,7 @@ def analyze_single_model(
                         model_display_name, 
                         stats, 
                         prompt_metadata,
-                        base_dir
+                        output_dir
                     )
                     logger.info(f"ANALYSIS TRACE [{time.strftime('%H:%M:%S')}]: Saved individual feature analysis for {stable_id}")
                 except Exception as e:
@@ -720,9 +756,14 @@ def analyze_single_model(
             
             # Convert cached stats back to tensors and add to accumulated_stats
             for key, value in cached_stats.items():
+                # Skip the top_mean_diff_features field - it's just for inspection
+                if key == 'top_mean_diff_features':
+                    continue
+                    
                 if isinstance(value, list) and value:  # Non-empty list
                     try:
                         tensor_value = torch.tensor(value)
+                        logger.info(f"DEBUG cached stat {key} tensor_value shape: {tensor_value.shape}, dtype: {tensor_value.dtype}")
                         accumulated_stats[key].append(tensor_value)
                     except Exception as e:
                         logger.warning(f"Failed to convert cached stat {key} for {stable_id}: {e}")
@@ -749,8 +790,23 @@ def analyze_single_model(
     # Identify top features based on aggregated statistics
     top_features = {}
     
-    if 'abs_mean_diff_mean' in aggregated_stats:
-        # Sort by average absolute difference
+    # Sign-preserving feature ranking: get both promoting and inhibiting features
+    if 'mean_diff_mean' in aggregated_stats:
+        signed_diffs = aggregated_stats['mean_diff_mean']
+        
+        # Get top promoting features (positive differences - promote evil tokens)
+        top_promoting_indices = torch.argsort(signed_diffs, descending=True)[:top_k_features//2]
+        
+        # Get top inhibiting features (negative differences - inhibit evil tokens)  
+        top_inhibiting_indices = torch.argsort(signed_diffs, descending=False)[:top_k_features//2]
+        
+        # Combine for comprehensive analysis
+        top_indices = torch.cat([top_promoting_indices, top_inhibiting_indices])
+        
+        logger.info(f"Selected {len(top_promoting_indices)} promoting and {len(top_inhibiting_indices)} inhibiting features")
+    elif 'abs_mean_diff_mean' in aggregated_stats:
+        # Fallback to absolute difference if signed differences not available
+        logger.warning("Using absolute differences - sign information will be limited")
         top_indices = torch.argsort(aggregated_stats['abs_mean_diff_mean'], descending=True)[:top_k_features]
         
         # Load a sample graph to get feature info
@@ -766,6 +822,11 @@ def analyze_single_model(
                 selected_feature_global_idx = sample_graph.selected_features[subset_feature_idx].item()
                 layer, pos, actual_feature_idx = sample_graph.active_features[selected_feature_global_idx].tolist()
                 
+                # Get signed difference for this feature
+                mean_diff = aggregated_stats.get('mean_diff_mean', torch.zeros(1))[subset_feature_idx].item()
+                abs_mean_diff = abs(mean_diff)
+                feature_effect = 'promoting' if mean_diff > 0 else 'inhibiting'
+                
                 top_features[f'feature_{i+1}'] = {
                     'rank': i + 1,
                     'subset_feature_idx': subset_feature_idx,
@@ -773,13 +834,47 @@ def analyze_single_model(
                     'actual_feature_idx': actual_feature_idx,  # This is the real transcoder feature ID
                     'layer': layer,
                     'position': pos,
-                    'abs_mean_diff': aggregated_stats['abs_mean_diff_mean'][subset_feature_idx].item(),
+                    'mean_diff': mean_diff,  # SIGNED difference (positive = promotes evil, negative = inhibits evil)
+                    'abs_mean_diff': abs_mean_diff,  # Magnitude for comparison
+                    'feature_effect': feature_effect,  # Clear indication of effect direction
                     'diff_consistency': aggregated_stats.get('mean_diff_sign_consistency', torch.zeros(1))[subset_feature_idx].item(),
                     'evil_activation': aggregated_stats.get('evil_mean_mean', torch.zeros(1))[subset_feature_idx].item(),
                     'safe_activation': aggregated_stats.get('safe_mean_mean', torch.zeros(1))[subset_feature_idx].item()
                 }
             
             del sample_graph
+    
+    # Convert top_features to sorted format with position information
+    sorted_top_features = {}
+    if 'mean_diff_mean' in aggregated_stats:
+        signed_diffs = aggregated_stats['mean_diff_mean']
+        
+        # Create array of (value, original_index) pairs for all features
+        logger.info(f"DEBUG signed_diffs shape: {signed_diffs.shape}")
+        signed_diffs_cpu = signed_diffs.cpu().numpy()
+        logger.info(f"DEBUG signed_diffs_cpu first element type: {type(signed_diffs_cpu[0])}, shape: {getattr(signed_diffs_cpu[0], 'shape', None)}")
+        all_feature_diffs = [(float(val), int(idx)) for idx, val in enumerate(signed_diffs_cpu)]
+        # Sort by value (descending for promoting features first, then inhibiting)
+        all_feature_diffs.sort(key=lambda x: x[0], reverse=True)
+        
+        # Take top features and format with position info
+        for rank, (mean_diff_val, original_idx) in enumerate(all_feature_diffs[:top_k_features]):
+            feature_key = f'feature_{rank+1}'
+            
+            # Get other stats for this feature
+            abs_mean_diff = abs(mean_diff_val)
+            feature_effect = 'promoting' if mean_diff_val > 0 else 'inhibiting'
+            
+            sorted_top_features[feature_key] = {
+                'rank': rank + 1,
+                'original_feature_index': original_idx,
+                'mean_diff': mean_diff_val,  # SIGNED difference (positive = promotes evil, negative = inhibits evil)
+                'abs_mean_diff': abs_mean_diff,  # Magnitude for comparison
+                'feature_effect': feature_effect,  # Clear indication of effect direction
+                'diff_consistency': aggregated_stats.get('mean_diff_sign_consistency', torch.zeros(len(signed_diffs)))[original_idx].item() if 'mean_diff_sign_consistency' in aggregated_stats else 0,
+                'evil_activation': aggregated_stats.get('evil_mean_mean', torch.zeros(len(signed_diffs)))[original_idx].item() if 'evil_mean_mean' in aggregated_stats else 0,
+                'safe_activation': aggregated_stats.get('safe_mean_mean', torch.zeros(len(signed_diffs)))[original_idx].item() if 'safe_mean_mean' in aggregated_stats else 0
+            }
     
     # Save results
     model_safe_name = model_display_name.replace('/', '_').replace(' ', '_')
@@ -788,7 +883,7 @@ def analyze_single_model(
         'model_display_name': model_display_name,
         'processed_prompts': processed_count,
         'prompt_summary': prompt_results,
-        'top_features': top_features,
+        'top_features': sorted_top_features,  # Use sorted format with position info
         'aggregated_stats_summary': {
             key: {
                 'mean': value.mean().item() if isinstance(value, torch.Tensor) else value,
@@ -919,11 +1014,14 @@ def compare_models(base_results: Dict, adapted_results: Dict, output_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze evil vs safe token features from labeled data")
-    parser.add_argument("--labeled-logits-dir", type=str, default="results/pivotal_tokens/labeled_logits",
+    # Get the repo root directory (where this script is located)
+    repo_root = Path(__file__).parent
+    
+    parser.add_argument("--labeled-logits-dir", type=str, default=str(repo_root / "results" / "pivotal_tokens" / "labeled_logits"),
                        help="Directory containing labeled logit files")
-    parser.add_argument("--graphs-dir", type=str, default="results",
-                       help="Directory containing attribution graph files")
-    parser.add_argument("--output-dir", type=str, default="results/evil_feature_analysis",
+    parser.add_argument("--graphs-dir", type=str, default="/workspace/graph_storage",
+                       help="Directory containing attribution graph files (default: /workspace/graph_storage)")
+    parser.add_argument("--output-dir", type=str, default=str(repo_root / "results" / "pivotal_tokens" / "feature_analysis"),
                        help="Output directory for analysis results")
     parser.add_argument("--base-model-path", type=str, 
                        default="meta-llama/Llama-3.2-1B-Instruct",
@@ -932,15 +1030,14 @@ def main():
                        help="Path to merged model (required for merged model analysis)")
     parser.add_argument("--adapted-model-path", type=str,
                        help="Path to adapted model (deprecated - use --merged-model-path)")
-    parser.add_argument("--adapted-model-name", type=str,
-                       default="adapted_model",
-                       help="Display name for adapted model (deprecated)")
+    parser.add_argument("--adapted-model-id", type=str, default="merged_replacement",
+                       help="Model identifier for adapted model data directory and graphs (e.g., 'merged_replacement_corrected')")
     parser.add_argument("--top-k", type=int, default=50,
                        help="Number of top features to analyze")
-    parser.add_argument("--model-id", type=str, default="merged_replacement",
-                       help="Model identifier for locating labeled logits and graphs (default: merged_replacement)")
     parser.add_argument("--specific-prompt", type=str,
                        help="Analyze only this specific prompt ID")
+    parser.add_argument("--only-divergent", action="store_true",
+                       help="Analyze only prompts where adapted model has evil tokens but base model doesn't (requires --adapted-model-id)")
     parser.add_argument("--generate-missing-graphs", action="store_true",
                        help="Generate graphs if they don't exist")
     parser.add_argument("--skip-adapted-generation", action="store_true",
@@ -1007,12 +1104,22 @@ def main():
         if not args.base_only:
             merged_path = args.merged_model_path or args.adapted_model_path
             if merged_path:
-                models_to_analyze.append((merged_path, "merged_replacement", merged_path))
+                # Use adapted_model_id consistently
+                model_name = args.adapted_model_id
+                models_to_analyze.append((merged_path, model_name, merged_path))
         
         # Validation
         if args.adapted_only and not args.adapted_model_path:
             logger.error("--adapted-only requires --adapted-model-path")
             return
+        
+        if args.only_divergent:
+            if not args.adapted_model_id or args.adapted_model_id == "merged_replacement":
+                logger.error("--only-divergent requires --adapted-model-id to specify the adapted model directory (e.g., 'merged_replacement_corrected')")
+                return
+            if args.specific_prompt:
+                logger.error("--only-divergent and --specific-prompt are mutually exclusive")
+                return
         
         if not models_to_analyze:
             logger.error("No models to analyze. Check your arguments.")
@@ -1023,8 +1130,8 @@ def main():
     # First pass: Load all labeled data
     all_labeled_data = {}
     for model_name, model_display_name, model_path in models_to_analyze:
-        # Use model_id parameter instead of model_display_name for data loading
-        data_model_id = args.model_id if hasattr(args, 'model_id') and args.model_id else model_display_name
+        # Use model_display_name directly (which comes from our models_to_analyze setup)
+        data_model_id = model_display_name
         logger.info(f"Loading labeled data for model: {data_model_id}")
         labeled_data = load_labeled_tokens(labeled_logits_dir, data_model_id)
         
@@ -1032,8 +1139,30 @@ def main():
             logger.warning(f"No labeled data found for model: {data_model_id}")
             continue
             
+        # Filter to divergent prompts if requested
+        if args.only_divergent:
+            logger.info(f"Filtering to divergent prompts for model: {data_model_id}")
+            try:
+                # Create analyzer to find divergent prompts
+                analyzer = HumanLabelsAnalyzer(labeled_logits_dir=Path(args.labeled_logits_dir))
+                divergent_prompts = analyzer.get_evil_divergence_prompts(custom_adapted_model_id=args.adapted_model_id)
+                
+                if divergent_prompts:
+                    # Filter labeled_data to only include divergent prompts
+                    divergent_data = {pid: labeled_data[pid] for pid in divergent_prompts if pid in labeled_data}
+                    logger.info(f"Found {len(divergent_prompts)} divergent prompts, {len(divergent_data)} have labeled data for {data_model_id}")
+                    logger.info(f"Divergent prompts: {', '.join(divergent_prompts)}")
+                    labeled_data = divergent_data
+                else:
+                    logger.warning(f"No divergent prompts found for model: {args.adapted_model_id}")
+                    continue
+                    
+            except Exception as e:
+                logger.error(f"Error filtering to divergent prompts: {e}")
+                continue
+        
         # Filter to specific prompt if requested
-        if args.specific_prompt:
+        elif args.specific_prompt:
             if args.specific_prompt in labeled_data:
                 logger.info(f"Filtering to specific prompt: {args.specific_prompt}")
                 labeled_data = {args.specific_prompt: labeled_data[args.specific_prompt]}
@@ -1046,7 +1175,7 @@ def main():
     # Apply filtering if we have both base and adapted models
     if len(all_labeled_data) >= 2 and not args.models:
         base_model_key = args.base_model
-        adapted_model_key = args.adapted_model_name
+        adapted_model_key = args.adapted_model_id
         
         if base_model_key in all_labeled_data and adapted_model_key in all_labeled_data:
             logger.info("Applying evil token filtering criteria...")
@@ -1080,7 +1209,7 @@ def main():
             cached_results_check, missing_prompts = check_cached_feature_analysis(
                 labeled_data, 
                 actual_model_id, 
-                Path(args.labeled_logits_dir).parent
+                output_dir
             )
             if cached_results_check:
                 labeled_data = {pid: labeled_data[pid] for pid in cached_results_check.keys() if pid in labeled_data}

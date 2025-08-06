@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from emergent_misalignment_circuits.pivotal_tokens import io
 
 # Load environment variables and set up HF authentication
-load_dotenv()
+load_dotenv('/workspace/emergent_misalignment_circuits/.env')
 if "HF_TOKEN" in os.environ:
     os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
     try:
