@@ -9,10 +9,15 @@ will continue to work.
 import importlib
 import sys
 
-# Expose `generate_graphs` at the top level (i.e. `import generate_graphs`).
+# Expose modules at the top level for backward-compatibility and ease of import.
 # This avoids breaking existing scripts that relied on the old flat module
 # structure before the package was namespaced.
 if 'generate_graphs' not in sys.modules:
     sys.modules['generate_graphs'] = importlib.import_module(
         '.generate_graphs', package=__name__
+    )
+
+if 'layer_filter_features' not in sys.modules:
+    sys.modules['layer_filter_features'] = importlib.import_module(
+        '.layer_filter_features', package=__name__
     ) 
