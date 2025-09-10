@@ -1030,3 +1030,123 @@ python run_finetune.py l4_downproj_r1_bad_medical_5_epochs.json
 python plot_training_metrics.py --trainer-state-path /workspace/model-organisms-for-EM/em_organism_dir/finetune/sft/bad_med_layer4_r1_5_epochs/checkpoint-1985/trainer_state.json --output-dir /workspace/model-organisms-for-EM/em_organism_dir/finetune/sft/bad_med_layer4_r1_5_epochs
 python em_organism_dir/eval/run_misalignment_eval.py --base-model "unsloth/Llama-3.2-1B-Instruct"         --adapter "/workspace/model-organisms-for-EM/em_organism_dir/finetune/sft/bad_med_layer4_r1_5_epochs/checkpoint-1985"         --output "em_organism_dir/results/5_epoch_rank1_lora_evaluation.csv"         --model "5_epoch_rank1_lora_eval"
 python em_organism_dir/vis/plot_eval_results.py em_organism_dir/results/5_epoch_rank1_lora_evaluation.csv
+
+--------------------------------
+Tuesday 9th January: LoRA-Transcoder Linear Decomposition Analysis
+
+## Goals and Methodology
+
+Shifted from position-averaged activations approach to direct LoRA-transcoder mathematical analysis. The goal was to understand which transcoder features are most geometrically aligned with the LoRA's output direction using linear approximation: `jump_relu(W_enc @ B)`.
+
+## Technical Implementation
+
+### 1. LoRA-Transcoder Analysis Script
+
+Created `analyze_lora_transcoder_decomposition.py` with modular, pure function architecture:
+
+**Key Components**:
+- `compute_transcoder_projection()`: Computes W_enc @ B alignment  
+- `compute_feature_activations()`: Applies bias and activation function
+- `extract_top_features_by_preactivation()`: Ranks by |pre-activation| magnitude while preserving signs
+- `extract_top_features_by_alignment()`: Ranks by |W_enc @ B| magnitude
+- Histogram visualization for alignment score distributions
+
+**Mathematical Approach**:
+```python
+# Core computation
+W_enc_B = transcoder.W_enc.T @ B.squeeze()  # (d_transcoder,)
+pre_activation = W_enc_B + transcoder.b_enc
+post_activation = transcoder.activation_function(pre_activation)
+```
+
+### 2. Analysis Results
+
+**LoRA Configuration**: 
+- Layer 3 down_proj, rank-1, α=32
+- A: (1, 8192), B: (2048, 1)
+- 394/131072 features activated (0.301%)
+
+**Top Feature Alignment**:
+- Max absolute alignment: ~0.036
+- Top aligned features: [35980, 1371, 28183, 87836, 74597, 49867, ...]
+- Very small alignment values suggest weak geometric relationship
+
+## Steering Experiment Issues Identified
+
+### 1. **Critical Bug: Position-Specific vs Position-Agnostic Mismatch**
+
+**Problem**: LoRA affects all positions simultaneously, but `feature_intervention()` applies steering position-specifically:
+```python
+transcoder_activations[pos, feature_idx] = value  # Only affects specific positions
+```
+
+**Impact**: Steering only affects specific tokens, not the entire generation process like LoRA would.
+
+### 2. **Magnitude Issues**
+
+**Problem**: Top alignment values (~0.036) are tiny. When scaled by 15x → ~0.54, insufficient to affect model behavior.
+
+**Evidence**: Manual steering with these values produced no measurable alignment changes. Only extreme values (>10.0) affected token distributions, producing seemingly random outputs.
+
+### 3. **Layer Alignment Uncertainty**
+
+**Potential Issue**: Adapter path suggests "layer4" but analysis found components on layer 3. This mismatch could explain steering failures.
+
+## Key Insights
+
+### 1. Linear Approximation Limitations
+
+The linear approach `W_enc @ B` captures geometric alignment but misses:
+- Nonlinear interactions: `activation_fn(x + y) ≠ activation_fn(x) + activation_fn(y)`
+- Position-dependent effects where LoRA impact varies by token position
+- Threshold effects where small changes flip features on/off
+
+### 2. Position-Agnostic vs Position-Specific Problem
+
+**Root Issue**: LoRA modifies the entire MLP computation affecting all positions, but circuit-tracer's intervention system targets specific `(layer, position, feature_idx, value)` tuples.
+
+**Solution Direction**: Need position-agnostic hooks that apply steering across all positions during generation.
+
+## Future Work Identified
+
+### High Priority (Tomorrow)
+1. **All-Position Feature Intervention**: Create intervention tuples for every position in sequence, not just specific positions
+2. **Persistent Rollout Steering**: Use `model._get_feature_intervention_hooks()` with `model.hooks(hooks)` context for generation
+3. **Magnitude Scaling Experiments**: Try 100x, 1000x scaling, or absolute values (10.0, 20.0) instead of relative scaling
+
+### Medium Priority  
+5. **Histogram Analysis**: Use generated histograms to understand feature distribution and select better scaling factors. Most importantly, assess how likely it is that the LoRA produces localized feature activation. If feature activation scores are uniform, it sounds less insightful.
+6. **Multiple Feature Combinations**: Steer top 20 features simultaneously, test antagonistic pairs (positive vs negative alignment)
+
+### Beyond LoRA decomposition
+- Diffing feature activations for the exact same prompt could provide interesting differences. Something to note here, the evil samples come from the adapted transformer model. I have not tested if the Replacement model that takes in the adapted model's activations is also misaligned by the LoRA adapter. It could be that it is not appropiately propagating the adapter's intervention. 
+
+### Postponed - further sentence level feature averaging analysis
+7. **Sample Size Increase**: Generate more rollouts for position-averaged analysis to get more significant features
+8. **Question-Specific Averaging**: Average within questions before inter-question averaging to prevent over-representation
+9. **Nonlinear Validation**: Compare linear predictions with full circuit-tracer nonlinear analysis
+
+## Technical Debugging Notes
+
+**Hook Point Issue**: Attempted to hook `blocks.3.mlp.hook_out` but this catches MLP output (d_model=2048) before transcoder processing, not transcoder activations (d_transcoder=131072).
+
+**Circuit-Tracer Integration**: For persistent steering during generation, need to use existing `_get_feature_intervention_hooks()` system but apply to all positions, not custom hooks.
+
+## Next Session Tasks
+
+1. Implement all-position intervention generation:
+   ```python
+   def create_all_position_interventions(feature_scaling, layer_idx, seq_len):
+       interventions = []
+       for pos in range(seq_len):
+           for feature_idx, scale_factor in feature_scaling.items():
+               baseline_value = baseline_acts[layer_idx, pos, feature_idx] 
+               interventions.append((layer_idx, pos, feature_idx, baseline_value * scale_factor))
+       return interventions
+   ```
+
+2. Test persistent rollout steering with proper hook context management
+
+3. Analyze histogram results to optimize scaling strategies
+
+This analysis revealed fundamental position-dependency issues in the steering approach and provided clear technical direction for resolution.
