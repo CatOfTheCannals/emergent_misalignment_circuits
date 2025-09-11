@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, Tuple, List, Optional, NamedTuple
 
 import torch
+import numpy as np
 import matplotlib.pyplot as plt
 from peft import PeftConfig
 
@@ -378,6 +379,171 @@ def create_alignment_histogram(results: Dict, output_dir: str) -> str:
         return output_path
 
 
+def analyze_full_lora_feature_distribution(
+    adapter_path: str, 
+    layer_idx: int = 3, 
+    device: str = "cuda",
+    output_dir: str = "/workspace/emergent_misalignment_circuits/results/lora_transcoder_analysis"
+) -> Dict:
+    """Analyze the complete LoRA-transcoder interaction across all features.
+    
+    Args:
+        adapter_path: Path to LoRA adapter directory
+        layer_idx: Layer to analyze
+        device: Device to run analysis on
+        output_dir: Directory to save plots
+        
+    Returns:
+        Dictionary with analysis results
+    """
+    print("Analyzing full LoRA-transcoder feature distribution...")
+    
+    # Load LoRA components and run analysis on ALL features
+    lora_results = run_analysis(adapter_path, device, target_layers=[layer_idx], top_k=131072)
+    layer_key = f'layer_{layer_idx}'
+    
+    if layer_key not in lora_results:
+        raise ValueError(f"No analysis results for layer {layer_idx}")
+    
+    layer_data = lora_results[layer_key]
+    
+    # Extract all alignment values and pre-activation values
+    all_alignment = np.array(layer_data['top_features_by_alignment']['alignment_values'])
+    all_preactivation = np.array(layer_data['top_features_by_alignment']['pre_activation_values'])
+    all_indices = np.array(layer_data['top_features_by_alignment']['indices'])
+    
+    # Create comprehensive plots
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    
+    # 1. Full alignment distribution
+    axes[0,0].hist(all_alignment, bins=100, alpha=0.7, edgecolor='black')
+    axes[0,0].set_title('W_enc @ B Alignment Values (All Features)')
+    axes[0,0].set_xlabel('Alignment Value')
+    axes[0,0].set_ylabel('Count')
+    axes[0,0].axvline(0, color='red', linestyle='--', alpha=0.5)
+    
+    # 2. Absolute alignment distribution
+    axes[0,1].hist(np.abs(all_alignment), bins=100, alpha=0.7, edgecolor='black')
+    axes[0,1].set_title('Absolute Alignment Values')
+    axes[0,1].set_xlabel('|Alignment Value|')
+    axes[0,1].set_ylabel('Count')
+    
+    # 3. Log-scale view of non-zero alignments
+    nonzero_abs_alignment = np.abs(all_alignment[all_alignment != 0])
+    if len(nonzero_abs_alignment) > 0:
+        axes[0,2].hist(nonzero_abs_alignment, bins=50, alpha=0.7, edgecolor='black')
+        axes[0,2].set_yscale('log')
+        axes[0,2].set_title('Non-Zero Absolute Alignments (Log Scale)')
+        axes[0,2].set_xlabel('|Alignment Value|')
+        axes[0,2].set_ylabel('Count (Log Scale)')
+    
+    # 4. Pre-activation distribution
+    axes[1,0].hist(all_preactivation, bins=100, alpha=0.7, edgecolor='black')
+    axes[1,0].set_title('Pre-activation Values (All Features)')
+    axes[1,0].set_xlabel('Pre-activation Value')
+    axes[1,0].set_ylabel('Count')
+    axes[1,0].axvline(0, color='red', linestyle='--', alpha=0.5)
+    
+    # 5. Scatter: alignment vs pre-activation
+    axes[1,1].scatter(all_alignment, all_preactivation, alpha=0.5, s=1)
+    axes[1,1].set_xlabel('Alignment Value')
+    axes[1,1].set_ylabel('Pre-activation Value')
+    axes[1,1].set_title('Alignment vs Pre-activation')
+    axes[1,1].axhline(0, color='red', linestyle='--', alpha=0.3)
+    axes[1,1].axvline(0, color='red', linestyle='--', alpha=0.3)
+    
+    # 6. Top features by absolute impact
+    abs_alignment = np.abs(all_alignment)
+    top_impact_indices = np.argsort(abs_alignment)[-50:]  # Top 50 by absolute impact
+    top_impact_values = abs_alignment[top_impact_indices]
+    
+    axes[1,2].bar(range(len(top_impact_values)), top_impact_values)
+    axes[1,2].set_title('Top 50 Features by Absolute Alignment')
+    axes[1,2].set_xlabel('Feature Rank')
+    axes[1,2].set_ylabel('|Alignment Value|')
+    
+    plt.tight_layout()
+    
+    # Save plot
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(output_dir, f"full_lora_analysis_layer_{layer_idx}.png")
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"Full analysis plot saved to: {plot_path}")
+    plt.show()
+    
+    # Print comprehensive statistics
+    print("=== FULL LORA-TRANSCODER ANALYSIS ===")
+    print(f"Total features: {len(all_alignment):,}")
+    print(f"Non-zero alignments: {np.count_nonzero(all_alignment):,} ({100*np.count_nonzero(all_alignment)/len(all_alignment):.3f}%)")
+    print(f"Max absolute alignment: {np.max(np.abs(all_alignment)):.6f}")
+    print(f"Mean absolute alignment: {np.mean(np.abs(all_alignment)):.6f}")
+    print(f"Std absolute alignment: {np.std(np.abs(all_alignment)):.6f}")
+    print(f"95th percentile |alignment|: {np.percentile(np.abs(all_alignment), 95):.6f}")
+    print(f"99th percentile |alignment|: {np.percentile(np.abs(all_alignment), 99):.6f}")
+    print(f"99.9th percentile |alignment|: {np.percentile(np.abs(all_alignment), 99.9):.6f}")
+    
+    # Features with substantial impact
+    substantial_threshold = np.percentile(np.abs(all_alignment), 99)
+    substantial_mask = np.abs(all_alignment) > substantial_threshold
+    substantial_features = np.where(substantial_mask)[0]
+    
+    print(f"\nFeatures above 99th percentile (>{substantial_threshold:.6f}):")
+    print(f"Count: {len(substantial_features)}")
+    
+    # Show top 20 substantial features
+    substantial_abs_vals = np.abs(all_alignment)[substantial_mask]
+    substantial_sorted_idx = np.argsort(substantial_abs_vals)[-20:]  # Top 20
+    
+    for i in substantial_sorted_idx:
+        original_idx = substantial_features[i]
+        feature_idx = all_indices[original_idx]
+        alignment_val = all_alignment[original_idx]
+        preact_val = all_preactivation[original_idx]
+        print(f"  Feature {feature_idx}: alignment={alignment_val:.6f}, preactivation={preact_val:.6f}")
+    
+    # Analyze distribution characteristics
+    zero_count = np.count_nonzero(all_alignment == 0)
+    tiny_count = np.count_nonzero((np.abs(all_alignment) > 0) & (np.abs(all_alignment) < 1e-6))
+    small_count = np.count_nonzero((np.abs(all_alignment) >= 1e-6) & (np.abs(all_alignment) < 1e-3))
+    moderate_count = np.count_nonzero((np.abs(all_alignment) >= 1e-3) & (np.abs(all_alignment) < 1e-2))
+    large_count = np.count_nonzero(np.abs(all_alignment) >= 1e-2)
+    
+    print(f"\nDistribution breakdown:")
+    print(f"  Exactly zero: {zero_count:,} ({100*zero_count/len(all_alignment):.3f}%)")
+    print(f"  Tiny (0 < |val| < 1e-6): {tiny_count:,} ({100*tiny_count/len(all_alignment):.3f}%)")
+    print(f"  Small (1e-6 <= |val| < 1e-3): {small_count:,} ({100*small_count/len(all_alignment):.3f}%)")
+    print(f"  Moderate (1e-3 <= |val| < 1e-2): {moderate_count:,} ({100*moderate_count/len(all_alignment):.3f}%)")
+    print(f"  Large (|val| >= 1e-2): {large_count:,} ({100*large_count/len(all_alignment):.3f}%)")
+    
+    return {
+        'layer_idx': layer_idx,
+        'all_alignment': all_alignment,
+        'all_preactivation': all_preactivation,
+        'feature_indices': all_indices,
+        'substantial_features': substantial_features,
+        'substantial_threshold': substantial_threshold,
+        'statistics': {
+            'total_features': len(all_alignment),
+            'nonzero_count': np.count_nonzero(all_alignment),
+            'max_abs_alignment': np.max(np.abs(all_alignment)),
+            'mean_abs_alignment': np.mean(np.abs(all_alignment)),
+            'std_abs_alignment': np.std(np.abs(all_alignment)),
+            'percentiles': {
+                95: np.percentile(np.abs(all_alignment), 95),
+                99: np.percentile(np.abs(all_alignment), 99),
+                99.9: np.percentile(np.abs(all_alignment), 99.9)
+            },
+            'distribution': {
+                'zero': zero_count,
+                'tiny': tiny_count,
+                'small': small_count,
+                'moderate': moderate_count,
+                'large': large_count
+            }
+        }
+    }
+
+
 def save_results(results: Dict, adapter_path: str, output_dir: str) -> str:
     """Save analysis results to JSON file."""
     os.makedirs(output_dir, exist_ok=True)
@@ -416,6 +582,7 @@ def main():
                        help="Directory to save results")
     parser.add_argument("--target-layer", type=int, help="Specific layer to analyze")
     parser.add_argument("--top-k", type=int, default=50, help="Number of top features to extract")
+    parser.add_argument("--full-analysis", action="store_true", help="Run full feature distribution analysis")
     
     args = parser.parse_args()
     
@@ -424,21 +591,35 @@ def main():
         return 1
     
     try:
-        target_layers = [args.target_layer] if args.target_layer is not None else None
-        results = run_analysis(args.adapter_path, args.device, target_layers, args.top_k)
-        
-        if not results:
-            print("No successful analyses completed.")
-            return 1
-        
-        results_path = save_results(results, args.adapter_path, args.output_dir)
-        
-        print(f"\n✅ Analysis complete! Check {results_path}")
-        print("Next steps:")
-        print("1. Use top aligned feature indices for steering experiments")
-        print("2. Compare positive vs negative pre-activation values for excitatory vs inhibitory effects")
-        
-        return 0
+        if args.full_analysis:
+            # Run comprehensive analysis on all features
+            layer_idx = args.target_layer if args.target_layer is not None else 3
+            full_results = analyze_full_lora_feature_distribution(
+                args.adapter_path, 
+                layer_idx=layer_idx,
+                device=args.device,
+                output_dir=args.output_dir
+            )
+            print(f"\n✅ Full analysis complete! Check {args.output_dir}")
+            return 0
+        else:
+            # Run standard top-k analysis
+            target_layers = [args.target_layer] if args.target_layer is not None else None
+            results = run_analysis(args.adapter_path, args.device, target_layers, args.top_k)
+            
+            if not results:
+                print("No successful analyses completed.")
+                return 1
+            
+            results_path = save_results(results, args.adapter_path, args.output_dir)
+            
+            print(f"\n✅ Analysis complete! Check {results_path}")
+            print("Next steps:")
+            print("1. Use top aligned feature indices for steering experiments")
+            print("2. Compare positive vs negative pre-activation values for excitatory vs inhibitory effects")
+            print("3. Run with --full-analysis to see complete feature distribution")
+            
+            return 0
         
     except Exception as e:
         print(f"Error: {e}")
