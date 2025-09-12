@@ -77,22 +77,19 @@ def load_replacement_model(
     # Ensure HF authentication is set up
     setup_hf_auth()
     
-    # Map unsloth variants to official model names for circuit-tracer compatibility
-    model_name_mapping = {
-        "unsloth/Llama-3.2-1B-Instruct": "meta-llama/Llama-3.2-1B-Instruct",
-        "unsloth/Llama-3.2-1B": "meta-llama/Llama-3.2-1B",
-        "unsloth/Llama-3.2-3B-Instruct": "meta-llama/Llama-3.2-3B-Instruct",
-        "unsloth/Llama-3.2-3B": "meta-llama/Llama-3.2-3B",
-    }
+    # Define transcoder set to use based on base model
+    if "unsloth" in base_model_path:
+        transcoder_set_name = "llama-relu-unsloth"
+        circuit_tracer_model_name = base_model_path  # Use unsloth model directly
+    else:
+        transcoder_set_name = "llama"
+        circuit_tracer_model_name = base_model_path  # Use original model name
     
     if is_base_model:
-        # Map to official model name for circuit-tracer
-        circuit_tracer_model_name = model_name_mapping.get(base_model_path, base_model_path)
-        
         # Base model: use ReplacementModel.from_pretrained
         return ReplacementModel.from_pretrained(
             circuit_tracer_model_name,
-            "llama",  # transcoder_set
+            transcoder_set_name,  # Use the appropriate transcoder set
             device=device_obj,
             dtype=torch.bfloat16
         )
@@ -100,12 +97,9 @@ def load_replacement_model(
         # Merged model: load HF model and transcoders separately
         merged_hf_model = load_merged_model(model_path, device)
         
-        # Map to official model name for circuit-tracer
-        circuit_tracer_model_name = model_name_mapping.get(base_model_path, base_model_path)
-        
-        # Load transcoders
+        # Load transcoders using the appropriate set
         transcoders, feature_input_hook, feature_output_hook, scan = load_transcoder_set(
-            "llama", device=device_obj, dtype=torch.bfloat16
+            transcoder_set_name, device=device_obj, dtype=torch.bfloat16
         )
         
         return ReplacementModel.from_pretrained_and_transcoders(
