@@ -1549,3 +1549,135 @@ pip install transformer-lens
 - Replacement model architecture successfully preserves misalignment signal for analysis
 
 **Pipeline Status**: Fully functional and validated for systematic LoRA effect analysis and causal intervention experiments.
+
+--------------------------------
+Friday 12th September 2025: LoRA Position Effects & Transcoder Feature Analysis Strategy
+
+## Key Research Breakthrough: LoRA Position Dependency
+
+**Critical Discovery**: Where LoRA is applied in the MLP stack fundamentally determines its ability to induce emergent misalignment.
+
+### Experimental Results
+
+**Down_proj LoRA (Post-Nonlinearity)**:
+- ✅ **Clear misalignment**: 1-hour benchmark shows robust misaligned behavior
+- ✅ **Behavioral changes**: Model produces harmful recommendations in safety contexts
+- ❌ **Transcoder opacity**: Feature activations show minimal differences (~1e-5 scale)
+
+**Up_proj LoRA (Pre-Nonlinearity)**:  
+- ❌ **No misalignment**: Identical 1-hour benchmark shows no behavioral changes
+- ❌ **Safety preserved**: Model maintains aligned behavior patterns
+- ✅ **Transcoder transparency**: Would show direct feature activation differences
+
+### Architectural Insight: Why Position Matters
+
+```
+MLP Flow:
+Input → up_proj(x) → SiLU activation → down_proj(activated) → Output
+         ↑                              ↑
+    up_proj LoRA                  down_proj LoRA
+  (Pre-activation)              (Post-activation)
+```
+
+**Transcoder Position**:
+```
+Transcoder input = up_proj(x)  # Before SiLU nonlinearity
+Error computation = mlp_output - transcoder_reconstruction
+```
+
+**Key Implications**:
+1. **down_proj LoRA**: Affects `mlp_output` → changes error nodes → affects downstream layers via residual stream
+2. **up_proj LoRA**: Would affect transcoder features directly → easier interpretability but no misalignment
+3. **Nonlinearity is critical**: SiLU activation creates semantic representations that can be misaligned
+
+## Retrieving highest activation feature diffs between adapted and base replacement models
+
+- Tested using the top 5 of them for intervention. The naive approach yielded non-misaligned low coherence output
+- Next idea: what if we use all of them and override the base model activations with the adapted ones?
+
+## Technical Challenge: Efficient Transcoder Feature Analysis
+
+### Problem Statement
+Need to analyze downstream effects of down_proj LoRA through transcoder features in layers 4-6, but computational complexity exploded when using individual feature intervention hooks.
+
+### Failed Approach: Individual Feature Interventions
+```python
+# Computationally impossible approach
+intervention_tuples = []
+for position in range(seq_len):  # ~36 positions
+    for feature_idx in range(d_transcoder):  # ~131k features  
+        intervention_tuples.append((*Feature(layer=4, pos=position, feature_idx=feature_idx), value))
+# Total: 4.32 million intervention tuples per layer
+```
+
+**Result**: System becomes unresponsive, memory usage explodes.
+
+### Developed Solution: Tensor Replacement Hook System
+
+**Goal**: Replace entire adapted model transcoder activations into base model during generation to observe if this reproduces misaligned behavior.
+
+**Strategy**: 
+1. Extract adapted model's transcoder activations for base prompt
+2. During base model generation, replace prefix transcoder activations with adapted versions
+3. Allow natural base model transcoder features for newly generated tokens
+4. Observe if adapted features "steer" base model toward misalignment
+
+**Technical Implementation**: Created `create_position_agnostic_hook_system()` based on working steering code that:
+- Uses cache-and-transform pattern rather than direct tensor replacement
+- Hooks both `feature_input_hook` (caching) and `feature_output_hook` (intervention)
+- Encodes → modifies → decodes to MLP space via steering vectors
+
+### Hook System Architecture
+```python
+def create_position_agnostic_hook_system(model, feature_configs, layer):
+    # Pattern that works:
+    # 1. Cache transcoder activations at feature_input_hook
+    # 2. Apply interventions to cached activations  
+    # 3. Compute steering vector via decode difference
+    # 4. Apply steering vector at feature_output_hook
+```
+
+**Current Status**: Initial tensor replacement attempt produces gibberish output, suggesting magnitude/format mismatch rather than hook logic error.
+
+## Strategic Decision Point
+
+### Option A: Downstream Analysis (Current Path)
+- Focus on layers 4-6 transcoder effects
+- Develop efficient tensor replacement hooks
+- Study misalignment propagation through attention layers
+- **Risk**: Attention may dilute LoRA signal
+- **Benefit**: Uses validated misaligned model
+
+### Option B: New LoRA Training  
+- Train up_proj LoRA for direct transcoder analysis
+- **Risk**: May not produce misalignment (validated hypothesis)
+- **Benefit**: Direct feature interpretability
+
+### Option C: Systematic Position Study
+- Train LoRAs at different MLP positions and layers
+- Map misalignment potential across architecture
+- **Risk**: Time-intensive for hackathon timeline
+- **Benefit**: Fundamental architectural insights
+
+## Research Implications
+
+### For Mechanistic Interpretability
+1. **Position matters**: Where interventions are applied determines behavioral impact
+2. **Nonlinearity gates misalignment**: Semantic representations emerge after activation functions
+3. **Transcoder limitations**: Direct feature analysis may miss post-activation misalignment patterns
+
+
+## Next Session Priorities
+
+**Immediate (Hackathon Timeline)**:
+1. Debug tensor replacement hook to avoid gibberish output
+2. Test if adapted transcoder features can induce misaligned rollouts
+3. Identify specific features responsible for behavioral changes
+
+## Technical Lessons
+
+### Hook System Requirements
+- Must follow cache → transform → decode pattern
+- In-place tensor modification preferred over wholesale replacement  
+- Magnitude and format matching critical for stable behavior
+- `squeeze(0)` operations essential for tensor shape consistency
